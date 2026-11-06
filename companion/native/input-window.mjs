@@ -202,7 +202,7 @@ export function createInputWindow({ api }) {
 
   return {
     /** 打开输入窗（物理像素坐标；`scale` 是显示器缩放，圆角/内边距/字体都按它放大）。 */
-    open({ x, y, width, height, initial = '', scale = 1 }) {
+    open({ x, y, width, height, initial = '', scale = 1, title = '自定义译文语种', placeholder = '输入语种，如 日本語 / 한국어' }) {
       this.close()
       ensureClass()
       const s = Number.isFinite(scale) && scale > 0 ? scale : 1
@@ -212,7 +212,7 @@ export function createInputWindow({ api }) {
       const h = Math.max(28, Math.round(height))
       metrics = { radius, border: Math.max(1, Math.round(s)) }
 
-      container = u.CreateWindowExW(WS_EX_TOPMOST, CLASS_NAME, '自定义译文语种', WS_POPUP | WS_VISIBLE, Math.round(x), Math.round(y), w, h, null, null, u.GetModuleHandleW(null), null)
+      container = u.CreateWindowExW(WS_EX_TOPMOST, CLASS_NAME, title, WS_POPUP | WS_VISIBLE, Math.round(x), Math.round(y), w, h, null, null, u.GetModuleHandleW(null), null)
       if (container === null) return false
       // 圆角：系统按这个区域裁剪窗口（硬边）；描边由 WM_PAINT 里的 RoundRect 画在上面
       const region = u.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2)
@@ -225,7 +225,7 @@ export function createInputWindow({ api }) {
       }
       const font = u.CreateFontW(-Math.round(14 * s), 0, 0, 0, 400, 0, 0, 0, 1 /* DEFAULT_CHARSET */, 0, 0, 5 /* CLEARTYPE_QUALITY */, 0, 'Microsoft YaHei UI')
       if (font !== null) u.SendMessageW(edit, WM.SETFONT, font, 1)
-      u.SendMessageStrW(edit, WM.SETCUEBANNER, 1, '输入语种，如 日本語 / 한국어')
+      u.SendMessageStrW(edit, WM.SETCUEBANNER, 1, placeholder)
       if (typeof initial === 'string' && initial !== '') u.SetWindowTextW(edit, initial)
       this.focus()
       return true

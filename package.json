@@ -28,6 +28,7 @@
   ],
   "files": [
     "index.js",
+    "client.js",
     "settings.mjs",
     "companion",
     "cordis.patch.yml",
@@ -37,12 +38,18 @@
   ],
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "dsh": {
     "manifestVersion": 1,
-    "bundle": { "patch": "./cordis.patch.yml" }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
   },
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\""
@@ -50,5 +57,12 @@
   "meta": {
     "title": "划词翻译",
     "description": "在任意 Windows 应用里划词，鼠标旁弹出只含译文的置顶卡片；译文流式出现并跟随最新一行，单次上限 15000 字。"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "optionalDependencies": {
+    "@resvg/resvg-wasm": "^2.6.2",
+    "mathjax-full": "^3.2.1"
   }
 }

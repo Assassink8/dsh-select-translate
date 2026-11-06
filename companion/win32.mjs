@@ -163,6 +163,7 @@ export function createWin32(hints = []) {
   api.ShowWindow = user32.func('bool ShowWindow(void *hWnd, int nCmdShow)')
   api.SetWindowRgn = user32.func('int SetWindowRgn(void *hWnd, void *hRgn, bool bRedraw)')
   api.ReleaseCapture = user32.func('bool ReleaseCapture()')
+  api.SetCapture = user32.func('void *SetCapture(void *hWnd)')
   api.SendMessageW = user32.func('intptr_t SendMessageW(void *hWnd, unsigned int Msg, uintptr_t wParam, intptr_t lParam)')
   api.GetDpiForWindow = user32.func('unsigned int GetDpiForWindow(void *hWnd)')
   try {

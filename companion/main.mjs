@@ -33,22 +33,26 @@ import {
   paintTriggerIcon,
   triggerIconHit,
   triggerIconLayout,
+  MODEL_MENU_MAX_ROWS,
   TRIGGER,
   TRIGGER_WINDOW,
   CARD,
 } from './card.mjs'
+import { applicationName, createApplicationReader, isApplicationDisabled, probeAllowedApplication } from './application.mjs'
 import { createContextReader } from './context.mjs'
 import { prepareSourceText } from './text.mjs'
 import { createGestureDetector } from './gesture.mjs'
 import { hitZone } from './hitzone.mjs'
 import { createEdgeDetector, pointInCardRect } from './input.mjs'
-import { createGdi } from './native/gdi.mjs'
+import { findFormulas, renderFormula } from './formula.mjs'
+import { createOcr } from './ocr.mjs'
+import { createGdi, rgb } from './native/gdi.mjs'
 import { createInputWindow } from './native/input-window.mjs'
 import { createNativeWindow } from './native/window.mjs'
 import { computePlacement, clampWindowToWork } from './placement.mjs'
 import { createTranslator } from './translate.mjs'
 import { createWin32, monitorScaleForPoint, workAreaForPoint, windowClass, windowRect, windowTitle } from './win32.mjs'
-import { resolveRuntimeFile } from '../settings.mjs'
+import { DEFAULT_HOTKEY, normalizeHotkey, normalizeModel, normalizeDisabledApps, parseModelInput, resolveRuntimeFile } from '../settings.mjs'
 
 /* ────────────────────────── 配置 ────────────────────────── */
 
@@ -61,8 +65,22 @@ const LISTEN_PORT = Number(process.env.DSH_ST_PORT ?? 0)
 const MAX_TEXT = 15000
 /** 初始触发模式：宿主 spawn 时经 env 给（见 index.js）；拿不到就按即划即译。 */
 const INITIAL_MODE = process.env.DSH_ST_MODE === 'icon' ? 'icon' : 'auto'
+/** 初始推理等级：宿主 spawn 时经 env 给；空串 = 自动。 */
+const INITIAL_EFFORT = typeof process.env.DSH_ST_EFFORT === 'string' && process.env.DSH_ST_EFFORT !== '' ? process.env.DSH_ST_EFFORT : null
+/** 截图翻译热键的末键（前缀固定 Ctrl+Alt）：宿主 spawn 时经 env 给，非法就回默认 S。 */
+const INITIAL_HOTKEY = normalizeHotkey(process.env.DSH_ST_HOTKEY) ?? DEFAULT_HOTKEY
 /** 宿主下发的路由令牌：打宿主 `/dsh-select-translate/api/*` 时必须带上（见 index.js 的 API_TOKEN）。 */
 const HOST_TOKEN = process.env.DSH_ST_TOKEN ?? ''
+
+let initialModel = null
+try {
+  initialModel = normalizeModel(JSON.parse(process.env.DSH_ST_MODEL ?? 'null'))
+} catch {
+  // 旧宿主或非法配置按跟随默认模型处理。
+}
+
+let disabledApps = []
+try { disabledApps = normalizeDisabledApps(JSON.parse(process.env.DSH_ST_DISABLED_APPS ?? '[]')) } catch {}
 
 const state = {
   startedAt: Date.now(),
@@ -81,6 +99,9 @@ const state = {
   paintSkips: 0,
   /** 运行时文件路径（写成功才有；给排障工具读端口与令牌）。 */
   runtimeFile: null,
+  /** 截图翻译：全局热键是否注册成功、框选层是否显示中。 */
+  hotkey: false,
+  shot: false,
 }
 
 function noteError(scope, error) {
@@ -129,6 +150,7 @@ if (api === null) {
   process.exit(3)
 }
 
+const readApplication = createApplicationReader(api)
 const reader = createContextReader({ koffiHint: KOFFI_BASE, timeoutMs: UIA_TIMEOUT_MS })
 const gdi = createGdi(api.koffi)
 gdi.startup()
@@ -148,6 +170,11 @@ const card = {
   text: '',
   source: '',
   target: 'auto',
+  model: initialModel,
+  inputKind: 'language',
+  application: null,
+  applicationDisabled: false,
+  iconApplication: null,
   /** 宿主回传的"自动"判定结果（`zh` / `en`），用来在头部显示「自动·中文」。 */
   resolved: null,
   /** 用户自定义过的目标语种（如 `日本語`）；下拉里再点"自定义…"时作为输入框初值。 */
@@ -161,10 +188,29 @@ const card = {
   iconVisible: false,
   iconAnchor: { x: 0, y: 0 },
   iconSource: '',
+  /** 小图标里的原文是不是来自截图 OCR / 整段公式（决定点开后用哪种提示词）。 */
+  iconOcr: false,
+  iconFormula: false,
   iconHover: false,
   iconScale: 1,
   pinned: false,
   langOpen: false,
+  /** 打开的是哪个下拉：`lang` = 语种/应用；`model` = 可选模型；`null` = 收起。 */
+  menuMode: null,
+  /** 模型二级菜单的起始下标（滚轮改它，不按像素滚）。 */
+  menuScroll: 0,
+  /** 宿主 /models 读回来的候选模型；`null` = 还没读过。 */
+  modelRows: null,
+  modelLoading: false,
+  modelError: null,
+  /** 用户选择的推理等级（`null` = 自动，由宿主挑最省的一档）；是否可用由宿主二次校验。 */
+  effort: INITIAL_EFFORT,
+  /** 宿主 /efforts 读回来的档位；`null` = 还没读过。 */
+  effortRows: null,
+  effortLoading: false,
+  effortError: null,
+  /** 截图翻译热键的末键（前缀固定 Ctrl+Alt）；注册成功后 state.hotkey 为 true。 */
+  hotkey: INITIAL_HOTKEY,
   hover: null,
   copied: false,
   bodyHeight: CARD.bodyLine,
@@ -191,6 +237,10 @@ const card = {
   scrollBarAlpha: 0,
   /** 滚动条"保持显示"的截止时间戳。 */
   scrollBarUntil: 0,
+  /** 公式：latex → { key, png, width, height, ascent, descent }；由 renderCardFormulas 异步填充。 */
+  formulaImages: new Map(),
+  /** 上面这批图是按什么字号（物理像素）渲染的；显示器缩放变了要重渲。 */
+  formulaPx: 0,
 }
 
 let hoverZone = null
@@ -277,6 +327,7 @@ const win = createNativeWindow({
       data.contentHeight = measured.contentHeight
       data.scroll = measured.scroll
       data.langW = measured.langW
+      data.modelW = measured.modelW
       data.copyW = measured.copyW
       data.retryW = measured.retryW
       // 夹取后的真实卡片宽度（用户拖过就按拖过的来，超过上下限则落到边界）
@@ -299,6 +350,8 @@ const win = createNativeWindow({
   /** 滚轮翻长译文（内容比卡片高时才滚得动）。一格滚 3 行。小图标形态没有内容可滚。 */
   onWheel: (delta) => {
     if (card.iconVisible) return false
+    // 模型二级菜单开着：滚轮翻候选列表，别去滚正文（菜单是覆盖层，正文看不见）
+    if (card.langOpen === true && card.menuMode === 'model') return scrollModelMenu(delta)
     const moved = setScroll(card.scroll + (delta > 0 ? -1 : 1) * 3 * CARD.bodyLine)
     // 跟随模式跟着用户的意图走：滚到内容底就恢复"跟随最新"，往上滚就停住不再把他拽回去
     card.follow = atScrollBottom()
@@ -347,8 +400,14 @@ const win = createNativeWindow({
         pickLang(row)
         return true
       }
+      // 点另一个胶囊 = 直接切到那个菜单（语种 ↔ 模型），不用先收起
+      const chip = cardHitTest(dipX, dipY, layout)
+      if (chip === 'lang' || chip === 'model') {
+        handleCardAction(chip)
+        return true
+      }
       // 点菜单外只收起菜单，这一下不触发别的按钮（与视觉基准一致）
-      setCard({ langOpen: false })
+      closeMenu()
       return true
     }
     const zone = cardHitTest(dipX, dipY, layout)
@@ -357,6 +416,278 @@ const win = createNativeWindow({
     return true
   },
 })
+
+/* ────────────────────────── 截图翻译：全屏框选层 ────────────────────────── */
+
+/** 框选层是否正在显示（决定了 Esc、点击、重绘是否归它处理）。 */
+let shotActive = false
+let shotStart = null
+/** 框选层覆盖的虚拟屏矩形（框选窗口坐标系的原点）。 */
+let shotBounds = null
+
+/** 截图翻译的全局热键：前缀固定 Ctrl+Alt（MOD_ALT | MOD_CONTROL），末键可配。 */
+const SHOT_HOTKEY_ID = 0x51
+const SHOT_HOTKEY_MODS = 0x0003
+
+/** 末键 → 虚拟键码：A–Z / 0–9 用字符码，F1–F12 从 0x70 起。 */
+function hotkeyVk(key) {
+  if (typeof key === 'string' && key.length === 1) return key.charCodeAt(0)
+  const match = /^F([1-9]|1[0-2])$/.exec(String(key ?? ''))
+  return match === null ? 0 : 0x70 + Number(match[1]) - 1
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * 应用（并注册）截图热键。换键时先注销旧的再注册新的；
+ * 注册失败只记一条错误、保留界面里的键值，菜单入口仍可用。
+ */
+function applyHotkey(key, options = {}) {
+  const next = normalizeHotkey(key)
+  if (next === null) return false
+  card.hotkey = next
+  if (shot.isAlive() !== true) return false
+  try {
+    shot.unregisterHotkey(SHOT_HOTKEY_ID)
+  } catch {
+    /* 没注册过也无所谓 */
+  }
+  const ok = shot.registerHotkey(SHOT_HOTKEY_ID, SHOT_HOTKEY_MODS, hotkeyVk(next)) === true
+  state.hotkey = ok
+  if (!ok && options.quiet !== true) {
+    noteError('hotkey', new Error(`Ctrl+Alt+${next} 暂时注册不上（可能被别的程序占用），会重试；也可用卡片语种菜单里的「截图翻译…」`))
+  }
+  requestPaint()
+  return ok
+}
+
+/** 虚拟屏幕（所有显示器合起来）的物理像素矩形：框选层要盖满它。 */
+function screenshotBounds() {
+  return {
+    x: api.GetSystemMetrics(76 /* SM_XVIRTUALSCREEN */),
+    y: api.GetSystemMetrics(77 /* SM_YVIRTUALSCREEN */),
+    w: api.GetSystemMetrics(78 /* SM_CXVIRTUALSCREEN */),
+    h: api.GetSystemMetrics(79 /* SM_CYVIRTUALSCREEN */),
+  }
+}
+
+function shotRectFrom(start, end) {
+  return {
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    w: Math.abs(end.x - start.x),
+    h: Math.abs(end.y - start.y),
+  }
+}
+
+/**
+ * 压暗层：全屏、置顶、逐像素透明，只负责把选区外压暗。
+ *
+ * 鼠标事件都挂在这层；拖动时**不重绘**它，而是用 `setRegion` 在窗口区域上挖洞，
+ * 让选区直接透出下面的真实屏幕。
+ */
+const shot = createNativeWindow({
+  api,
+  gdi,
+  className: 'DshSelectTranslateShotWnd',
+  title: '截图翻译',
+  initialState: { rect: null },
+  onError: (error) => noteError('shot-wndproc', error),
+  onHitTest: () => 'client',
+  onHotkey: () => {
+    if (!shotActive) void startShot()
+  },
+  onPaint: (painter, width, height, data) => {
+    const dim = rgb('#000000', 112)
+    // 压暗层只画一次：拖动时用窗口区域挖洞，不再整屏重绘（整屏 blit 一帧 60–90ms，鼠标一动就卡）
+    painter.fillRect(0, 0, width, height, dim)
+    if (data.showHint !== false) {
+      const hint = '拖动选择要翻译的区域 · Esc 取消'
+      const m = painter.measure(hint, { size: 15 })
+      const hx = Math.round((width - m.width) / 2)
+      painter.fillRoundRect(hx - 14, 28, Math.round(m.width) + 28, 34, 8, rgb('#0b1220', 170))
+      painter.text(hint, hx, 37, Math.round(m.width) + 28, 22, { size: 15, color: rgb('#ffffff') })
+      return undefined
+    }
+    return undefined
+  },
+  onMouseDown: (x, y) => {
+    if (!shotActive) return 'click'
+    shotStart = { x, y }
+    // 选区一旦挖洞，指针就在"没有窗口"的位置上了；捕获鼠标才能继续收到 move/up。
+    if (shot.state.hwnd !== null) api.SetCapture(shot.state.hwnd)
+    // 提示条只该出现一次；拖动开始后重画一整帧把它擦掉（这是整个流程里唯一一次整屏重绘）。
+    if (shot.data().showHint !== false) shot.setState({ showHint: false })
+    applyShotRect(null)
+    return 'click'
+  },
+  onHover: (x, y) => {
+    if (!shotActive || shotStart === null) return false
+    applyShotRect(shotRectFrom(shotStart, { x, y }))
+    return false
+  },
+  onClick: (x, y) => {
+    if (!shotActive) return false
+    api.ReleaseCapture()
+    const start = shotStart
+    shotStart = null
+    applyShotRect(null)
+    if (start !== null) void finishShot(shotRectFrom(start, { x, y }))
+    return false
+  },
+  onRightClick: () => {
+    api.ReleaseCapture()
+    cancelShot()
+    return false
+  },
+})
+
+/**
+ * 跟随选框的小窗口：只画边框与尺寸标签，随拖动 resize（几 ms）。
+ * 它是 `clickThrough` 的，鼠标事件仍然落在下面的压暗层上。
+ */
+const shotFrame = createNativeWindow({
+  api,
+  gdi,
+  className: 'DshSelectTranslateShotFrame',
+  title: '截图选区',
+  clickThrough: true,
+  initialState: { rect: null, drawn: null },
+  onError: (error) => noteError('shot-frame', error),
+  onHitTest: () => 'client',
+  onPaint: (painter, width, height, data) => {
+    const r = data.rect
+    if (r === null || r === undefined) return undefined
+    const wantW = Math.max(4, Math.round(r.w) + 4)
+    const wantH = Math.max(4, Math.round(r.h) + 26)
+    const wantX = Math.round((shotBounds?.x ?? 0) + r.x - 2)
+    const wantY = Math.round((shotBounds?.y ?? 0) + r.y - 2)
+    const drawn = data.drawn
+    // 第一趟（尺寸还是旧的）只回报目标矩形；第二趟尺寸对上了才真画。
+    if (drawn === null || drawn === undefined || drawn.x !== wantX || drawn.y !== wantY || drawn.width !== wantW || drawn.height !== wantH || width !== wantW || height !== wantH) {
+      data.drawn = { x: wantX, y: wantY, width: wantW, height: wantH }
+      return { x: wantX, y: wantY, width: wantW, height: wantH }
+    }
+    const bw = Math.max(1, Math.round(r.w))
+    const bh = Math.max(1, Math.round(r.h))
+    painter.strokeRoundRect(2, 2, bw, bh, 2, rgb('#4c8dff'), 2)
+    const label = bw + ' × ' + bh + ' · 松开识别'
+    const m = painter.measure(label, { size: 12 })
+    const ly = bh + 2
+    painter.fillRoundRect(6, ly, Math.round(m.width) + 12, 20, 6, rgb('#0b1220', 200))
+    painter.text(label, 12, ly + 3, Math.round(m.width) + 12, 18, { size: 12, color: rgb('#ffffff') })
+    return undefined
+  },
+})
+
+/** 把当前选区同步成"压暗层上的洞 + 跟随的小窗"。 */
+function applyShotRect(rect) {
+  const valid = rect !== null && rect !== undefined && rect.w >= 1 && rect.h >= 1
+  shot.setRegion(valid ? [rect] : null)
+  if (!valid) {
+    shotFrame.hide()
+    return
+  }
+  // 先改数据再 show：show 会按新几何画一帧，省掉"旧尺寸画一次、新尺寸再画一次"
+  const data = shotFrame.data()
+  data.rect = rect
+  const wantW = Math.max(4, Math.round(rect.w) + 4)
+  const wantH = Math.max(4, Math.round(rect.h) + 26)
+  shotFrame.show(
+    Math.round((shotBounds?.x ?? 0) + rect.x - 2),
+    Math.round((shotBounds?.y ?? 0) + rect.y - 2),
+    wantW,
+    wantH,
+  )
+}
+
+/** 打开框选层：先把卡片收掉、抓屏，再显示（顺序反了会把框选层自己抓进图）。 */
+async function startShot() {
+  if (shotActive) return
+  if (card.visible || card.iconVisible) {
+    hideCard()
+    await new Promise((resolve) => setTimeout(resolve, 80))
+  }
+  const bounds = screenshotBounds()
+  try {
+    await ocr.capture()
+  } catch (error) {
+    noteError('ocr-capture', error)
+    const pt = {}
+    api.GetCursorPos(pt)
+    setCard({ status: 'error', text: '截图失败：' + (error instanceof Error ? error.message : String(error)), source: '' })
+    place({ x: pt.x, y: pt.y })
+    return
+  }
+  shotActive = true
+  shotStart = null
+  shotBounds = bounds
+  shotFrame.hide()
+  shot.setRegion(null)
+  // 直接改 data 再 show：show 自己会画一帧，避免先 setState 画一次小尺寸再重画整屏
+  Object.assign(shot.data(), { showHint: true })
+  shot.show(bounds.x, bounds.y, bounds.w, bounds.h)
+  state.shot = true
+}
+
+function cancelShot() {
+  if (!shotActive) return
+  shotActive = false
+  shotStart = null
+  state.shot = false
+  api.ReleaseCapture()
+  applyShotRect(null)
+  shot.hide()
+}
+
+/** 松手：按框选矩形裁图识别，然后走普通翻译链路。 */
+async function finishShot(local) {
+  shotActive = false
+  shotStart = null
+  state.shot = false
+  api.ReleaseCapture()
+  applyShotRect(null)
+  shot.hide()
+
+  const bounds = screenshotBounds()
+  const rect = { x: bounds.x + local.x, y: bounds.y + local.y, w: local.w, h: local.h }
+  if (rect.w < 8 || rect.h < 8) return // 只是点了一下：当取消
+  const anchor = { x: rect.x + rect.w, y: rect.y + rect.h }
+
+  let text = ''
+  try {
+    const reply = await ocr.recognize(rect)
+    text = typeof reply?.text === 'string' ? reply.text : ''
+  } catch (error) {
+    noteError('ocr', error)
+    const message = error instanceof Error ? error.message : String(error)
+    setCard({ status: 'error', text: '截图识别失败：' + message, source: '' })
+    place(anchor)
+    return
+  }
+  const source = cleanOcrText(text)
+  if (source === '') {
+    setCard({ status: 'error', text: '截图里没有识别到文字，换个区域再试', source: '' })
+    place(anchor)
+    return
+  }
+  if (source.length > MAX_TEXT) {
+    setCard({ status: 'error', text: '截图识别出 ' + source.length + ' 字，超过 ' + MAX_TEXT + ' 字上限', source })
+    place(anchor)
+    return
+  }
+  const application = readApplication(anchor)
+  setCard({ application })
+  // 整段像公式（截图里是一道式子）→ 让宿主走"OCR 公式转写"提示词；否则正常翻译
+  const formula = looksLikeOcrFormula(source)
+  if (card.mode === 'icon') {
+    card.iconApplication = application
+    showIcon(anchor, source, { ocr: true, formula })
+    return
+  }
+  place(anchor)
+  await startTranslate(source, card.target, { ocr: true, formula })
+}
 
 /** 自定义语种的输入小窗：卡片是 WS_EX_NOACTIVATE 收不到键盘，只能另开一个可激活窗口（见 input-window.mjs）。 */
 const langInput = createInputWindow({ api })
@@ -400,6 +731,8 @@ function place(anchor, options = {}) {
   const s = monitorScaleForPoint(api, anchor.x, anchor.y)
   const work = workAreaForPoint(api, anchor.x, anchor.y)
   card.scale = s
+  // 换显示器（缩放变了）时公式图要按新字号重渲
+  if (card.formulaImages.size > 0 && card.formulaPx !== Math.max(12, Math.round(CARD.bodyFont * s))) void renderCardFormulas()
   card.anchor = { x: anchor.x, y: anchor.y }
   // 正文最多占工作区 60% 高
   card.maxBodyDip = Math.max(60, ((work.bottom - work.top) / s) * 0.6 - CARD.headerH - CARD.footerH - CARD.padY * 2)
@@ -422,6 +755,10 @@ function hideCard() {
   card.status = 'idle'
   card.hover = null
   card.langOpen = false
+  card.menuMode = null
+  card.menuScroll = 0
+  card.modelError = null
+  card.effortError = null
   card.scroll = 0
   hoverZone = null
   // 关卡片时把自定义语种输入小窗一起收掉，别留一个孤儿窗口在屏幕上
@@ -464,8 +801,11 @@ function placeIcon(anchor) {
  * 取词在亮图标之前做：这样拖动窗口/滚动条这类"没选出文字"的手势不会弹图标；
  * 而且点击时不必再读一次选区（与"点击时再取词"的做法不同，这是有意的）。
  */
-function showIcon(anchor, source) {
+function showIcon(anchor, source, options = {}) {
   card.iconSource = source
+  // 截图进来的原文要带着 OCR/公式标记，点图标后才走对提示词
+  card.iconOcr = options.ocr === true
+  card.iconFormula = options.formula === true
   placeIcon(anchor)
 }
 
@@ -483,6 +823,7 @@ function hideIcon() {
 async function activateIcon() {
   const text = card.iconSource
   const anchor = card.iconAnchor
+  const application = card.iconApplication
   // 就地换形态（不再 hideIcon()：那会先隐藏窗口再显示，闪一下）
   card.iconVisible = false
   card.iconHover = false
@@ -491,8 +832,10 @@ async function activateIcon() {
     win.hide()
     return
   }
+  if (isApplicationDisabled(application, disabledApps)) return
+  setCard({ application })
   place(anchor)
-  await startTranslate(text, card.target)
+  await startTranslate(text, card.target, { ocr: card.iconOcr === true, formula: card.iconFormula === true })
 }
 
 /** 屏幕物理坐标是否落在小图标的圆里。 */
@@ -516,6 +859,7 @@ function pointInCard(x, y) {
 /** 就地改状态并重绘（重绘走合帧，见 requestPaint）。 */
 function setCard(patch) {
   Object.assign(card, patch)
+  card.applicationDisabled = isApplicationDisabled(card.application, disabledApps)
   // 正文在变（流式 delta）或滚动位置在变 → 滚动条该露脸
   if (patch.text !== undefined || patch.scroll !== undefined) touchScrollBar()
   if (card.visible || card.iconVisible) requestPaint()
@@ -535,10 +879,157 @@ function setMode(mode) {
   return next
 }
 
+/** 打开二级"指定翻译模型"菜单：先切过去给反馈，再按需拉列表。 */
+function openModelMenu() {
+  // 列表已经在手时，直接把当前模型滚进可视区（重新拉取时由 loadModelMenu 再做一次）
+  let scroll = 0
+  const rows = Array.isArray(card.modelRows) ? card.modelRows : null
+  const current = card.model
+  if (rows !== null && rows.length > 0 && current !== null && current !== undefined) {
+    const index = rows.findIndex((row) => row.provider === current.provider && row.model === current.model)
+    if (index >= 0) {
+      const maxOffset = Math.max(0, rows.length - MODEL_MENU_MAX_ROWS)
+      scroll = Math.max(0, Math.min(maxOffset, index - Math.floor(MODEL_MENU_MAX_ROWS / 2)))
+    }
+  }
+  setCard({ langOpen: true, menuMode: 'model', menuScroll: scroll, modelError: null })
+  void loadModelMenu(false)
+}
+
+/** 收起菜单（下次展开默认落在语种菜单上）。 */
+function closeMenu() {
+  setCard({ langOpen: false, menuMode: null, menuScroll: 0, modelError: null, effortError: null })
+}
+
+/** 宿主下发的模型条目 → 卡片内部结构；缺 provider/model 的丢弃。 */
+function normalizeModelRow(raw) {
+  if (raw === null || typeof raw !== 'object') return null
+  const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
+  const model = typeof raw.model === 'string' ? raw.model.trim() : ''
+  if (provider === '' || model === '') return null
+  const providerName = typeof raw.providerName === 'string' && raw.providerName !== '' ? raw.providerName : provider
+  const name = typeof raw.name === 'string' && raw.name !== '' ? raw.name : model
+  return { provider, model, providerName, name }
+}
+
+let modelLoadSeq = 0
+
+/**
+ * 从宿主 `/models` 读可选模型。
+ *
+ * - 已经读到过就直接用（菜单打开是高频操作，不每次打宿主）；
+ * - `force` 用于"重新读取"：供应商刚登录/加配置时刷新；
+ * - 请求序号丢弃过期响应（连点两次"重新读取"时，旧响应不许覆盖新结果）。
+ */
+async function loadModelMenu(force) {
+  if (card.modelLoading === true) return
+  if (force !== true && Array.isArray(card.modelRows) && card.modelRows.length > 0) return
+  if (ORIGIN === '') {
+    setCard({ modelLoading: false, modelError: '没有宿主地址，无法读取模型列表' })
+    return
+  }
+  const seq = ++modelLoadSeq
+  setCard({ modelLoading: true, modelError: null })
+  try {
+    const response = await fetch(ORIGIN + '/dsh-select-translate/api/models', {
+      headers: HOST_TOKEN === '' ? {} : { 'x-dsh-select-translate-token': HOST_TOKEN },
+    })
+    if (!response.ok) throw new Error('读取模型列表失败：HTTP ' + response.status)
+    const payload = await response.json()
+    if (payload?.ok !== true || !Array.isArray(payload.models)) throw new Error(payload?.message || '模型列表格式不对')
+    if (seq !== modelLoadSeq) return
+    card.modelRows = payload.models.map(normalizeModelRow).filter((row) => row !== null)
+    card.modelLoading = false
+    card.modelError = null
+    card.menuScroll = 0
+    // 把当前选中的模型滚进可视区（列表可能有几十条，否则用户要自己找）
+    const current = card.model
+    if (current !== null && current !== undefined) {
+      const index = card.modelRows.findIndex((row) => row.provider === current.provider && row.model === current.model)
+      if (index >= 0) {
+        const maxOffset = Math.max(0, card.modelRows.length - MODEL_MENU_MAX_ROWS)
+        card.menuScroll = Math.max(0, Math.min(maxOffset, index - Math.floor(MODEL_MENU_MAX_ROWS / 2)))
+      }
+    }
+    requestPaint()
+  } catch (error) {
+    if (seq !== modelLoadSeq) return
+    card.modelRows = null
+    card.modelLoading = false
+    card.modelError = error instanceof Error ? error.message : String(error)
+    requestPaint()
+  }
+}
+
+/** 模型二级菜单的滚轮：一格一行（`menuScroll` 是起始下标）。 */
+function scrollModelMenu(delta) {
+  const total = Array.isArray(card.modelRows) ? card.modelRows.length : 0
+  const maxOffset = Math.max(0, total - MODEL_MENU_MAX_ROWS)
+  const next = Math.max(0, Math.min(maxOffset, card.menuScroll + (delta > 0 ? -1 : 1)))
+  if (next === card.menuScroll) return false
+  card.menuScroll = next
+  requestPaint()
+  return true
+}
+
 /** 选了目标语言：收起菜单并用同一段原文重译。`custom` 走原生输入小窗。 */
 function pickLang(id) {
+  // 状态行（"正在读取…"/错误）只是提示，点了不该当成语言
+  if (id === 'model-status' || id === 'effort-status') return
+  if (id === 'application') {
+    closeMenu()
+    void toggleApplication()
+    return
+  }
+  if (id === 'effort') {
+    openEffortMenu()
+    return
+  }
+  if (id === 'effort-refresh') {
+    void loadEfforts(true)
+    return
+  }
+  if (id === 'effort-back') {
+    setCard({ menuMode: 'model', effortError: null })
+    return
+  }
+  if (id === 'effort:auto') {
+    void saveEffort(null)
+    return
+  }
+  if (id.startsWith('effort:')) {
+    void saveEffort(id.slice('effort:'.length))
+    return
+  }
+  if (id === 'default-model') {
+    closeMenu()
+    void saveModel(null)
+    return
+  }
+  if (id === 'model-refresh') {
+    void loadModelMenu(true)
+    return
+  }
+  if (id === 'model-input') {
+    closeMenu()
+    openCustomLangInput('model')
+    return
+  }
+  if (id.startsWith('model:')) {
+    const index = Number(id.slice('model:'.length))
+    const entry = Array.isArray(card.modelRows) ? card.modelRows[index] : undefined
+    if (entry === undefined) return
+    closeMenu()
+    void saveModel({ provider: entry.provider, model: entry.model })
+    return
+  }
+  if (id === 'screenshot') {
+    closeMenu()
+    void startShot()
+    return
+  }
   if (id === 'custom') return openCustomLangInput()
-  setCard({ langOpen: false, target: id, copied: false })
+  setCard({ langOpen: false, menuMode: null, target: id, copied: false })
   void startTranslate(card.source, id)
 }
 
@@ -546,7 +1037,8 @@ function pickLang(id) {
  * 打开"自定义语种"输入小窗：贴在卡片下方（越界放上方），宽度跟卡片正文区一致。
  * 回车提交、Esc 取消、点到别处（失焦）也取消 —— 见轮询里的 `inputOpen` 分支。
  */
-function openCustomLangInput() {
+function openCustomLangInput(kind = 'language') {
+  card.inputKind = kind
   setCard({ langOpen: false })
   const s = card.scale || 1
   const wantW = Math.round((card.cardW - CARD.padX * 2) * s)
@@ -556,7 +1048,15 @@ function openCustomLangInput() {
   const x = win.state.x + Math.round(CARD.padX * s)
   const below = win.state.y + win.state.height + gap
   const y = below + wantH <= card.work.bottom ? below : win.state.y - wantH - gap
-  const opened = langInput.open({ x, y, width: wantW, height: wantH, initial: card.customTarget, scale: s })
+  const initial = kind === 'model'
+    ? (card.model ? card.model.provider + '/' + card.model.model : '')
+    : card.customTarget
+  const opened = langInput.open({
+    x, y, width: wantW, height: wantH, initial, scale: s,
+    ...(kind === 'model'
+      ? { title: '翻译模型：供应商 ID / 模型 ID', placeholder: '供应商ID/模型ID（使用 DSH 已配置的 ID）' }
+      : {}),
+  })
   if (!opened) {
     inputRect = null
     noteError('input', new Error('无法创建自定义语种输入窗'))
@@ -574,9 +1074,134 @@ function closeCustomLangInput(commit) {
   inputRect = null
   setCard({ inputOpen: false })
   if (value === '') return
+  if (card.inputKind === 'model') {
+    const model = parseModelInput(value)
+    if (model === null) {
+      translator.cancel()
+      setCard({ status: 'error', text: '模型格式应为 供应商ID/模型ID，例如 deepseek-official/deepseek-flash' })
+      return
+    }
+    void saveModel(model)
+    return
+  }
   const target = value.slice(0, 24)
   setCard({ customTarget: target, target, copied: false })
   if (card.source !== '') void startTranslate(card.source, target)
+}
+
+/** 先保存宿主设置，再重译，避免新请求仍使用旧模型。 */
+async function saveModel(model) {
+  translator.cancel()
+  try {
+    if (ORIGIN === '') throw new Error('没有拿到宿主地址，无法保存模型')
+    const response = await fetch(ORIGIN + '/dsh-select-translate/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-select-translate-token': HOST_TOKEN },
+      body: JSON.stringify({ model }),
+    })
+    if (!response.ok) throw new Error('保存模型失败：HTTP ' + response.status)
+    const saved = await response.json()
+    if (saved.ok !== true) throw new Error(saved.message || '保存模型失败')
+    setCard({ model: normalizeModel(saved.model) })
+    card.effortRows = null // 换模型后可用档位可能不同，下次打开推理等级菜单重新拉
+    if (card.visible && card.source) await startTranslate(card.source, card.target)
+  } catch (error) {
+    setCard({ status: 'error', text: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+/** 打开推理等级菜单：档位跟着"当前模型"走，所以每次打开都可以重新拉一次（有缓存就不拉）。 */
+function openEffortMenu() {
+  setCard({ langOpen: true, menuMode: 'effort', effortError: null })
+  void loadEfforts(false)
+}
+
+let effortLoadSeq = 0
+
+/** 从宿主 `/efforts` 读当前模型支持的推理等级；换模型后旧列表作废。 */
+async function loadEfforts(force) {
+  if (card.effortLoading === true) return
+  if (force !== true && Array.isArray(card.effortRows) && card.effortRows.length > 0) return
+  if (ORIGIN === '') {
+    setCard({ effortLoading: false, effortError: '没有宿主地址，无法读取推理等级' })
+    return
+  }
+  const seq = ++effortLoadSeq
+  setCard({ effortLoading: true, effortError: null })
+  try {
+    const response = await fetch(ORIGIN + '/dsh-select-translate/api/efforts', {
+      headers: HOST_TOKEN === '' ? {} : { 'x-dsh-select-translate-token': HOST_TOKEN },
+    })
+    if (!response.ok) throw new Error('读取推理等级失败：HTTP ' + response.status)
+    const payload = await response.json()
+    if (payload?.ok !== true || !Array.isArray(payload.efforts)) throw new Error(payload?.message || '推理等级格式不对')
+    if (seq !== effortLoadSeq) return
+    card.effortRows = payload.efforts
+      .map((entry) => (entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && entry.id !== ''
+        ? { id: entry.id, name: typeof entry.name === 'string' ? entry.name : '' }
+        : null))
+      .filter((entry) => entry !== null)
+    // 宿主会把"选了但该模型不支持"的档位报成 current=null，界面跟着显示为自动
+    card.effort = typeof payload.current === 'string' && payload.current !== '' ? payload.current : null
+    card.effortLoading = false
+    card.effortError = null
+    requestPaint()
+  } catch (error) {
+    if (seq !== effortLoadSeq) return
+    card.effortRows = null
+    card.effortLoading = false
+    card.effortError = error instanceof Error ? error.message : String(error)
+    requestPaint()
+  }
+}
+
+/** 保存推理等级（`null` = 自动）并重译；宿主会再校验一次该模型是否支持。 */
+async function saveEffort(effort) {
+  translator.cancel()
+  try {
+    if (ORIGIN === '') throw new Error('没有拿到宿主地址，无法保存推理等级')
+    const response = await fetch(ORIGIN + '/dsh-select-translate/api/settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-select-translate-token': HOST_TOKEN },
+      body: JSON.stringify({ effort }),
+    })
+    if (!response.ok) throw new Error('保存推理等级失败：HTTP ' + response.status)
+    const saved = await response.json()
+    if (saved.ok !== true) throw new Error(saved.message || '保存推理等级失败')
+    const next = typeof saved.effort === 'string' && saved.effort !== '' ? saved.effort : null
+    setCard({ effort: next, langOpen: false, menuMode: null, effortError: null })
+    if (next === null) card.effortRows = null // 回到"自动"后重新拉一次，拿到新的可用档位
+    if (card.visible && card.source) await startTranslate(card.source, card.target)
+  } catch (error) {
+    setCard({ status: 'error', text: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+/** 来源路径随选区保存，点菜单时不重新读取前台窗口。 */
+async function toggleApplication() {
+  const app = card.application
+  if (!app) return
+  const disabled = !isApplicationDisabled(app, disabledApps)
+  const previous = disabledApps
+  disabledApps = disabled ? [...new Set([...disabledApps, app])] : disabledApps.filter((path) => path !== app)
+  translator.cancel()
+  setCard({})
+  try {
+    if (!ORIGIN) throw new Error('无法保存应用规则：没有宿主地址')
+    const response = await fetch(ORIGIN + '/dsh-select-translate/api/applications', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-dsh-select-translate-token': HOST_TOKEN },
+      body: JSON.stringify({ app, disabled }),
+    })
+    if (!response.ok) throw new Error('保存应用规则失败：HTTP ' + response.status)
+    const saved = await response.json()
+    if (saved.ok !== true) throw new Error(saved.message || '保存应用规则失败')
+    disabledApps = normalizeDisabledApps(saved.disabledApps)
+    if (card.application === app) hideCard()
+  } catch (error) {
+    disabledApps = previous
+    if (card.application === app) setCard({ status: 'error', text: error instanceof Error ? error.message : String(error) })
+  }
 }
 
 function handleCardAction(zone) {
@@ -584,7 +1209,14 @@ function handleCardAction(zone) {
   // ⚡ = 即划即译开关；关掉改走小图标模式（不再是"什么都不做"），并持久化
   if (zone === 'bolt') return void setMode(card.mode === 'icon' ? 'auto' : 'icon')
   if (zone === 'pin') return setCard({ pinned: !card.pinned })
-  if (zone === 'lang') return setCard({ langOpen: !card.langOpen })
+  if (zone === 'lang') {
+    if (card.langOpen === true && card.menuMode === 'lang') return closeMenu()
+    return setCard({ langOpen: true, menuMode: 'lang', menuScroll: 0 })
+  }
+  if (zone === 'model') {
+    if (card.langOpen === true && card.menuMode === 'model') return closeMenu()
+    return openModelMenu()
+  }
   if (zone === 'retry') return void startTranslate(card.source, card.target)
   if (zone === 'copy') {
     try {
@@ -623,7 +1255,63 @@ const translator = createTranslator({
   isCurrent: (requestId) => String(card.requestId) === String(requestId),
 })
 
-async function startTranslate(text, target) {
+/**
+ * 截图翻译的 OCR 通道：常驻 PowerShell 辅助进程。
+ * 抓屏发生在「鼠标按下」那一刻（见 createGestureDetector 的 onPress），
+ * 这样应用自己画出来的选区高亮不会进图。
+ */
+const ocr = createOcr({ onError: (where, error) => noteError(where, error) })
+
+/** 公式位图缓存（跨多次翻译复用）：`px:latex` → 渲染结果。 */
+const formulaCache = new Map()
+const FORMULA_CACHE_MAX = 80
+let formulaSeq = 0
+
+/**
+ * 把当前译文里的 LaTeX 渲染成内联图片。
+ * 只在译文定稿后跑（流式期间每帧都渲太贵），渲染完再重绘一次。
+ */
+async function renderCardFormulas() {
+  const seq = ++formulaSeq
+  const text = typeof card.text === 'string' ? card.text : ''
+  const found = text === '' ? [] : findFormulas(text)
+  const px = Math.max(12, Math.round(CARD.bodyFont * (card.scale || 1)))
+  if (found.length === 0) {
+    if (card.formulaImages.size !== 0) {
+      card.formulaImages = new Map()
+      card.formulaPx = px
+    }
+    return
+  }
+  // 同一批公式已经按这个字号渲过：不重复渲染
+  if (card.formulaPx === px && found.every((item) => card.formulaImages.has(item.latex))) return
+  const images = new Map()
+  for (const item of found) {
+    if (images.has(item.latex)) continue
+    const key = px + ':' + item.latex
+    let entry = formulaCache.get(key)
+    if (entry === undefined) {
+      try {
+        const rendered = await renderFormula(item.latex, px)
+        if (seq !== formulaSeq) return
+        entry = { key, png: rendered.png, width: rendered.width, height: rendered.height, ascent: rendered.ascent, descent: rendered.descent }
+        formulaCache.set(key, entry)
+        if (formulaCache.size > FORMULA_CACHE_MAX) formulaCache.delete(formulaCache.keys().next().value)
+      } catch (error) {
+        noteError('formula', error)
+        continue
+      }
+    }
+    images.set(item.latex, entry)
+  }
+  if (seq !== formulaSeq) return
+  card.formulaImages = images
+  card.formulaPx = px
+  requestPaint()
+}
+
+async function startTranslate(text, target, options = {}) {
+  if (isApplicationDisabled(card.application, disabledApps)) return
   // 新一次翻译：把自定义语种输入小窗收掉（别让它挂在那儿）
   if (langInput.isOpen()) {
     langInput.close()
@@ -650,13 +1338,21 @@ async function startTranslate(text, target) {
     resolved: null,
     visible: true,
     langOpen: false,
+    menuMode: null,
+    menuScroll: 0,
     copied: false,
     scroll: 0,
     follow: true,
   })
 
   // run 内部会先取消上一次在途请求
-  const outcome = await translator.run({ text: source, target, requestId }, (event) => {
+  const outcome = await translator.run({
+    text: source,
+    target,
+    requestId,
+    ...(options.ocr === true ? { ocr: true } : {}),
+    ...(options.formula === true ? { formula: true } : {}),
+  }, (event) => {
     if (event.type === 'start') setCard({ resolved: event.resolved ?? null })
     else if (event.type === 'delta') setCard({ text: event.answer, status: 'running' })
     else if (event.type === 'error') setCard({ text: event.message, status: 'error' })
@@ -688,6 +1384,8 @@ async function startTranslate(text, target) {
     // 宿主那边的模型耗时。与 totalMs 的差 = **卡片落后模型多少**（合帧/绘制开销的直接指标）
     hostMs: typeof hostTiming?.totalMs === 'number' ? hostTiming.totalMs : null,
     hostFirstMs: typeof hostTiming?.firstTokenMs === 'number' ? hostTiming.firstTokenMs : null,
+    // 宿主首字看门狗触发过重试时 > 1（WorkBuddy 中继排队时很常见）
+    hostAttempts: typeof hostTiming?.attempts === 'number' ? hostTiming.attempts : null,
     paints: state.paints,
     paintMs: Math.round(state.paintMs),
     paintSkips: state.paintSkips,
@@ -695,11 +1393,63 @@ async function startTranslate(text, target) {
   // 宿主回过 error 帧时 card.status 已经是 error 了，别用 done 盖掉
   if (card.status === 'running') {
     // 生成结束：停止跟随、回到顶部 —— 卡片停下来时的常态应当是"从译文开头读"
-    setCard({ status: outcome.answer === '' ? 'error' : 'done', text: outcome.answer || '模型没有返回内容', scroll: 0, follow: false })
+    setCard({ status: outcome.answer === '' ? 'error' : 'done', text: outcome.answer || '模型没有返回内容（可点「重译」或换一个模型）', scroll: 0, follow: false })
+    // 定稿后再把公式渲成图（流式期间保持 LaTeX 原文，省得每帧重排）
+    void renderCardFormulas()
   }
 }
 
 /* ────────────────────────── 手势 → 取词 → 卡片 ────────────────────────── */
+
+let gestureSequence = 0
+
+/** 拖拽矩形（屏幕物理坐标；负坐标/越界由 OCR 辅助进程裁剪）。 */
+function gestureRect(down, at) {
+  const left = Math.min(down.x, at.x)
+  const top = Math.min(down.y, at.y)
+  return { x: left, y: top, w: Math.abs(at.x - down.x), h: Math.abs(at.y - down.y) }
+}
+
+/** Windows OCR 会在每个汉字之间插空格，这里还原；保留换行以便分段。 */
+function cleanOcrText(raw) {
+  let text = String(raw ?? '').replace(/\r/g, '')
+  for (let i = 0; i < 3; i += 1) text = text.replace(/([\u3400-\u9fff])\s+(?=[\u3400-\u9fff])/g, '$1')
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .join('\n')
+    .trim()
+}
+
+/** OCR 文本里的数学符号（截图公式常见）。 */
+const OCR_MATH_SYMBOL = /[√∫∮∑∏±×÷≤≥≈≠∞∂∇∈∉⊂⊆∪∩∼≃∥·θαβγδελσφωΓΔΣΠΦΨΩϵ−→⇒↔⌈⌉⌊⌋∝≡⊥]/g
+
+/**
+ * 截图 OCR 出来的整段文字是不是"一道公式"。
+ *
+ * 截图 OCR 与文字层不同：字母间会夹空格、上下标被拍平、分数线丢失，
+ * 所以判据比宿主那边宽一些；但**含较多汉字就一律不当公式**（那是要翻译的正文）。
+ * 只作为 `formula` 提示传给宿主，不在这里做任何改写。
+ */
+function looksLikeOcrFormula(text) {
+  const body = String(text ?? '').trim()
+  if (body === '' || body.length > 600) return false
+  const cjk = (body.match(/[\u3400-\u9fff]/g) ?? []).length
+  if (cjk > 4) return false
+  const symbols = (body.match(OCR_MATH_SYMBOL) ?? []).length
+  const equals = (body.match(/[=≈≤≥<>]/g) ?? []).length
+  const compact = body.replace(/\s+/g, '')
+  const mathChars = (body.match(/[0-9+\-*/=<>|^_{}()[\]\\]/g) ?? []).length + symbols
+  const density = mathChars / Math.max(1, compact.length)
+  if (symbols >= 1 && density >= 0.3) return true
+  if (symbols >= 2 && density >= 0.15) return true
+  if (equals >= 2 && body.length <= 120) return true
+  if (equals >= 1 && body.length <= 40 && density >= 0.25) return true
+  // 积分/根号/求和这类"不可能出现在普通句子里的首字符组合"
+  if (/[∫∮∑∏√]/.test(body) && body.length <= 300) return true
+  return false
+}
 
 async function handleGesture(gesture) {
   // 自定义语种输入小窗里发起的拖动（选词/移动光标）不是"划词"：既不该关卡片，也不该去取词。
@@ -720,14 +1470,34 @@ async function handleGesture(gesture) {
   const at = { x: gesture.x, y: gesture.y }
   const down = { x: gesture.downX, y: gesture.downY }
 
+  const sequence = ++gestureSequence
+  const application = readApplication(at)
+  const shift = gesture.shift === true
+
+  // 截图翻译现在由独立热键 + 框选层触发（见 startShot），这里不再拦截 Ctrl+拖拽：
+  // Ctrl 在浏览器/编辑器里太常用，拖拽时按着 Ctrl 反而会误触。
+
   let probe = null
   try {
-    // retries: 2 —— Chromium/WebView2 是"被 UIA 问到才打开无障碍树"，冷启动第一次必失败
-    probe = await reader.probe(at, { press: down, retries: 2 })
+    const allowed = await probeAllowedApplication({
+      app: application, disabledApps, shift,
+      probe: () => reader.probe(at, { press: down, retries: 2 }),
+    })
+    if (sequence !== gestureSequence) return
+    if (allowed.blocked) {
+      if (allowed.manage) {
+        translator.cancel()
+        setCard({ application, source: '', text: applicationName(application) + ' 已禁用划词翻译。点击「翻译 ⌄」→「启用此应用」恢复。', status: 'done', scroll: 0, follow: false })
+        place(at)
+      }
+      return
+    }
+    probe = allowed.result
   } catch (error) {
     noteError('probe', error)
   }
 
+  if (sequence !== gestureSequence || isApplicationDisabled(application, disabledApps)) return
   const selection = typeof probe?.selection === 'string' ? prepareSourceText(probe.selection).trim() : ''
   state.lastProbe = {
     at: Date.now(),
@@ -738,6 +1508,7 @@ async function handleGesture(gesture) {
   }
 
   if (selection === '') return // 没选到文字：什么都不弹（v1 不做剪贴板兜底）
+  setCard({ application })
   if (selection.length > MAX_TEXT) {
     place(at)
     setCard({ status: 'error', text: '选中的文本有 ' + selection.length + ' 字，超过 ' + MAX_TEXT + ' 字上限', source: selection })
@@ -746,6 +1517,7 @@ async function handleGesture(gesture) {
 
   // 小图标模式：亮图标，等用户点（原文已经在手里，点击时不必再读一次选区）
   if (card.mode === 'icon') {
+    card.iconApplication = application
     showIcon(at, selection)
     return
   }
@@ -756,7 +1528,7 @@ async function handleGesture(gesture) {
 }
 
 const detector = createGestureDetector({
-  onGesture: (gesture) => void handleGesture(gesture),
+  onGesture: (gesture) => void handleGesture({ ...gesture, shift: (api.GetAsyncKeyState(0x10 /* VK_SHIFT */) & 0x8000) !== 0 }),
   // 按下就判"点别处即关"：**单击（无位移、非双击）不产生任何手势**，
   // 所以这条不能写在 handleGesture 里——写在里面的话，单击卡片外部永远关不掉卡片
   // （只有"单击时手抖超过 5px"才会关）。
@@ -799,8 +1571,14 @@ const timer = setInterval(() => {
         if (langInput.focus() !== true && Date.now() - card.inputOpenedAt > 1500) closeCustomLangInput(false)
       }
     } else if (isEscapeEdge(escPressed)) {
-      if (card.iconVisible === true) hideIcon()
-      else if (card.visible) hideCard()
+      if (shotActive) cancelShot()
+      else if (card.iconVisible === true) hideIcon()
+      else if (card.visible && card.langOpen === true) {
+        // Esc 直接收起当前菜单（语种/模型各一个，不再有层级后退）
+        hoverZone = null
+        closeMenu()
+        setCard({ hover: null })
+      } else if (card.visible) hideCard()
     }
     // 小图标**不**因为鼠标移开而收起：它会一直显示，直到下一次鼠标按下（点图标本体除外）、
     // Esc、新手势/新选区、切回即划即译或打开卡片（0.1.5 起）。
@@ -855,7 +1633,19 @@ const server = createServer((req, res) => {
         iconSource: card.iconSource === '' ? '' : card.iconSource.slice(0, 40),
         pinned: card.pinned,
         langOpen: card.langOpen,
+        menuMode: card.menuMode,
+        menuScroll: card.menuScroll,
+        modelCount: Array.isArray(card.modelRows) ? card.modelRows.length : 0,
+        modelLoading: card.modelLoading,
+        modelError: card.modelError,
+        effort: card.effort,
+        effortCount: Array.isArray(card.effortRows) ? card.effortRows.length : 0,
+        effortLoading: card.effortLoading,
+        effortError: card.effortError,
         target: card.target,
+        model: card.model,
+        application: card.application,
+        applicationDisabled: card.applicationDisabled,
         bodyHeight: Math.round(card.bodyHeight),
         contentHeight: Math.round(card.contentHeight),
         scroll: Math.round(card.scroll),
@@ -874,6 +1664,12 @@ const server = createServer((req, res) => {
         alive: win.isAlive(),
         scale: card.iconVisible ? card.iconScale : card.scale,
         rect: card.visible || card.iconVisible ? { x: win.state.x, y: win.state.y, w: win.state.width, h: win.state.height } : null,
+        // 截图翻译：热键是否注册成功、当前组合、框选层是否在显示
+        hotkey: state.hotkey,
+        hotkeyKey: card.hotkey,
+        shot: state.shot,
+        shotWindow: shot.isAlive() ? { hwnd: String(shot.state.hwnd), visible: shot.state.visible, x: shot.state.x, y: shot.state.y, w: shot.state.width, h: shot.state.height } : null,
+        shotFrameWindow: shotFrame.isAlive() ? { visible: shotFrame.state.visible, x: shotFrame.state.x, y: shotFrame.state.y, w: shotFrame.state.width, h: shotFrame.state.height } : null,
       },
       origin: ORIGIN,
     })
@@ -889,6 +1685,24 @@ const server = createServer((req, res) => {
     void (async () => {
       try {
         const parsed = JSON.parse((await readBody(req)) || '{}')
+        if (Object.hasOwn(parsed, 'disabledApps')) {
+          disabledApps = normalizeDisabledApps(parsed.disabledApps)
+          setCard({})
+          if (card.applicationDisabled) hideCard()
+        }
+        if (Object.hasOwn(parsed, 'model')) setCard({ model: normalizeModel(parsed.model) })
+        if (Object.hasOwn(parsed, 'effort')) {
+          setCard({
+            effort: typeof parsed.effort === 'string' && parsed.effort !== '' ? parsed.effort : null,
+            effortRows: null,
+            effortError: null,
+          })
+        }
+        if (Object.hasOwn(parsed, 'hotkey')) {
+          // 宿主推过来（启动/改设置）：换键并重新注册；非法值不动当前键
+          const key = normalizeHotkey(parsed.hotkey)
+          if (key !== null && (key !== card.hotkey || state.hotkey !== true)) applyHotkey(key)
+        }
         if (parsed.mode === 'auto' || parsed.mode === 'icon') {
           // 只应用，不回写：回写由"用户点 ⚡"那一侧负责，避免两边互相推
           setCard({ mode: parsed.mode })
@@ -909,6 +1723,7 @@ const server = createServer((req, res) => {
         const parsed = JSON.parse((await readBody(req)) || '{}')
         const x = Math.round(Number(parsed.x ?? 400))
         const y = Math.round(Number(parsed.y ?? 300))
+        card.iconApplication = null
         showIcon({ x, y }, typeof parsed.text === 'string' ? parsed.text : '')
         return json(res, 200, { ok: true, mode: card.mode, rect: { x: win.state.x, y: win.state.y, w: win.state.width, h: win.state.height } })
       } catch (error) {
@@ -936,6 +1751,18 @@ const server = createServer((req, res) => {
       try {
         const parsed = JSON.parse((await readBody(req)) || '{}')
         const delta = Number(parsed.delta ?? 0)
+        // 模型二级菜单打开时，滚轮滚动的是模型列表而不是正文（与 onWheel 保持一致）
+        if (card.langOpen && card.menuMode === 'model' && Number.isFinite(delta) && delta !== 0) {
+          const moved = scrollModelMenu(delta)
+          if (moved && card.visible) requestPaint()
+          const total = Array.isArray(card.modelRows) ? card.modelRows.length : 0
+          return json(res, 200, {
+            ok: true,
+            moved,
+            menuScroll: card.menuScroll,
+            maxOffset: Math.max(0, total - MODEL_MENU_MAX_ROWS),
+          })
+        }
         const moved = setScroll(Number.isFinite(delta) ? card.scroll + delta : 0)
         // 与真实滚轮同一套语义：滚到内容底恢复跟随，往上滚就停住；滚动条也跟着淡入
         card.follow = atScrollBottom()
@@ -964,7 +1791,7 @@ const server = createServer((req, res) => {
         const y = Math.round(Number(parsed.y ?? 300))
         const text = typeof parsed.text === 'string' && parsed.text !== '' ? parsed.text : 'The scheduler multiplexes goroutines onto OS threads.'
         place({ x, y })
-        setCard({ copied: false, source: text, langOpen: parsed.langOpen === true })
+        setCard({ application: null, copied: false, source: text, langOpen: parsed.langOpen === true, menuMode: parsed.langOpen === true ? 'lang' : null, menuScroll: 0 })
         if (parsed.fake === true) {
           // 假流式：不打宿主，直接把给定译文逐字吐出来（纯视觉验收用，节奏固定好断言）
           const full = typeof parsed.fakeText === 'string' ? parsed.fakeText : '调度器把 goroutine 复用到操作系统线程上。'
@@ -1045,6 +1872,7 @@ const server = createServer((req, res) => {
             hitBolt: layout.hitBolt,
             dividerX: layout.dividerX,
             hitLang: layout.hitLang,
+            hitModel: layout.hitModel,
             hitCopy: layout.hitCopy,
             hitRetry: layout.hitRetry,
             langMenu: layout.langMenu,
@@ -1075,13 +1903,71 @@ const server = createServer((req, res) => {
         }
         if (zone === null) {
           if (card.langOpen) {
-            setCard({ langOpen: false })
+            closeMenu()
             return json(res, 200, { ok: true, zone: null, message: 'menu closed' })
           }
           return json(res, 200, { ok: true, zone: null, message: 'no hit' })
         }
         handleCardAction(zone)
         return json(res, 200, { ok: true, zone })
+      } catch (error) {
+        return json(res, 500, { ok: false, message: error instanceof Error ? error.message : String(error) })
+      }
+    })()
+    return
+  }
+
+  if (url.pathname === '/shot') {
+    void (async () => {
+      try {
+        const parsed = JSON.parse((await readBody(req)) || '{}')
+        if (parsed.cancel === true) {
+          cancelShot()
+          return json(res, 200, { ok: true, shot: false })
+        }
+        // 排障：只显示框选层、不抓屏（在没有截屏权限的环境里看框选层长什么样）
+        if (parsed.preview === true) {
+          if (shotActive) return json(res, 200, { ok: true, shot: true })
+          const b = screenshotBounds()
+          shotActive = true
+          shotStart = null
+          shotBounds = b
+          shotFrame.hide()
+          shot.setRegion(null)
+          Object.assign(shot.data(), { showHint: true })
+          shot.show(b.x, b.y, b.w, b.h)
+          state.shot = true
+          return json(res, 200, { ok: true, shot: true, preview: true })
+        }
+        // 排障：框选层已经开着时，直接画一个矩形预览（不需要真的拖鼠标）
+        if (parsed.rect !== undefined && shotActive) {
+          const r = parsed.rect ?? {}
+          applyShotRect({ x: Math.round(Number(r.x) || 0), y: Math.round(Number(r.y) || 0), w: Math.round(Number(r.w) || 0), h: Math.round(Number(r.h) || 0) })
+          return json(res, 200, { ok: true, preview: true })
+        }
+        await startShot()
+        return json(res, 200, { ok: true, shot: shotActive })
+      } catch (error) {
+        return json(res, 500, { ok: false, message: error instanceof Error ? error.message : String(error) })
+      }
+    })()
+    return
+  }
+
+  if (url.pathname === '/ocr') {
+    void (async () => {
+      try {
+        const parsed = JSON.parse((await readBody(req)) || '{}')
+        const x = Math.round(Number(parsed.x))
+        const y = Math.round(Number(parsed.y))
+        const w = Math.round(Number(parsed.w))
+        const h = Math.round(Number(parsed.h))
+        if (![x, y, w, h].every(Number.isFinite) || w < 2 || h < 2) return json(res, 400, { ok: false, message: 'x/y/w/h required' })
+        const started = Date.now()
+        await ocr.capture()
+        const reply = await ocr.recognize({ x, y, w, h })
+        const text = typeof reply?.text === 'string' ? reply.text : ''
+        return json(res, 200, { ok: true, text, chars: cleanOcrText(text).length, ms: Date.now() - started })
       } catch (error) {
         return json(res, 500, { ok: false, message: error instanceof Error ? error.message : String(error) })
       }
@@ -1148,6 +2034,23 @@ server.listen(LISTEN_PORT, '127.0.0.1', () => {
     win.create()
   } catch (error) {
     noteError('window', error)
+  }
+  // 截图翻译的框选层：隐藏窗口常驻，热键由它接收（WM_HOTKEY → startShot）
+  try {
+    shot.create()
+    shotFrame.create()
+    if (!applyHotkey(card.hotkey)) {
+      // 上一次的伴生进程可能还没完全退出、或者别的软件临时占着这个组合；
+      // 每隔 5 秒再试一次，最多 1 分钟。成功就停，失败也不影响菜单入口。
+      let tries = 0
+      const retry = setInterval(() => {
+        tries += 1
+        if (applyHotkey(card.hotkey, { quiet: true }) === true || tries >= 12) clearInterval(retry)
+      }, 5000)
+      retry.unref?.()
+    }
+  } catch (error) {
+    noteError('shot', error)
   }
   // 宿主靠这一行正则抓端口（0 = 随机端口）。走 stdout 私有管道，网页读不到。
   process.stdout.write('dsh-select-translate companion listening on http://127.0.0.1:' + port + '\n')

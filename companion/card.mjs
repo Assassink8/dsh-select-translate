@@ -16,6 +16,8 @@
  * 所有尺寸都用 DIP 写，绘制时统一乘 `s`（显示器缩放）→ painter 收物理像素。
  */
 
+import { applicationName } from './application.mjs'
+import { findFormulas } from './formula.mjs'
 import { normalizeLineBreaks } from './text.mjs'
 
 export const CARD = {
@@ -46,14 +48,17 @@ export const CARD = {
   actionPadX: 10,
   actionGap: 6,
   actionFootGap: 4,
-  // 语言下拉：与 视觉基准 的 .hc-langs 对齐（top 40 / left 10 / 宽 128 / 行高 30 / 内边距 4）
+  // 下拉：与 视觉基准 的 .hc-langs 对齐（top 40 / left 10 / 宽 200 / 行高 30 / 内边距 4）
   langTop: 40,
   langLeft: 10,
-  langWidth: 128,
+  langWidth: 200,
   langRowH: 30,
   langPad: 4,
+  // 头部两个胶囊（语种 / 模型）之间的间距
+  chipGap: 12,
   // 命中宽度的初值：真实值由 paintCard 量出来后回写（首帧用这些，不影响窗口尺寸）
-  langW: 115,
+  langW: 105,
+  modelW: 105,
   copyW: 65,
   retryW: 65,
   /**
@@ -85,7 +90,131 @@ const COLOR = {
 
 /** 语言下拉的顺序与显示名（与 视觉基准 的 LANGS 一致；`custom` 是"输入自定义语种"那一行）。 */
 export const LANG_IDS = ['auto', 'zh', 'en', 'custom']
-export const LANG_LABELS = { auto: '自动', zh: '中文', en: 'English', custom: '自定义…' }
+/** 语种菜单的行：语种 + 截图翻译 + 应用规则（模型已经拆到独立的「模型」胶囊里，不再混在这里）。 */
+export const LANG_MENU_IDS = [...LANG_IDS, 'screenshot', 'application']
+/** @deprecated 旧名，等价于 LANG_MENU_IDS。 */
+export const MENU_IDS = LANG_MENU_IDS
+export const MODEL_LABELS = { 'default-model': '跟随默认模型' }
+export const LANG_LABELS = { auto: '自动', zh: '中文', en: 'English', custom: '自定义…', screenshot: '截图翻译…' }
+/** 没指定模型时，头部模型胶囊显示的文案。 */
+export const MODEL_CHIP_DEFAULT = '默认模型'
+
+/** 推理等级的显示名：off = 关闭思考，其余按档位；模型自带的 name 优先。 */
+export const EFFORT_LABELS = {
+  auto: '自动',
+  off: '关闭思考',
+  none: '关闭思考',
+  disabled: '关闭思考',
+  minimal: '极简',
+  low: '低',
+  medium: '中',
+  high: '高',
+  max: '最大',
+}
+
+export function effortLabel(id, name) {
+  const key = String(id ?? '').toLowerCase()
+  if (EFFORT_LABELS[key] !== undefined) return EFFORT_LABELS[key]
+  return typeof name === 'string' && name !== '' ? name : String(id ?? '')
+}
+
+/**
+ * 模型二级菜单一屏最多列几条。
+ *
+ * 菜单是覆盖层，卡片会被撑到"刚好放下菜单"的高度；模型可能有几十个，
+ * 所以这里只排一屏、其余靠滚轮（`menuScroll` 是**起始下标**，不是像素偏移）。
+ * 屏幕内另有两条固定项：顶部「跟随默认模型」、底部「手动输入…」。
+ */
+export const MODEL_MENU_MAX_ROWS = 7
+
+/**
+ * 二级"指定翻译模型"菜单的行。`langOpen` 为 true 且 `menuMode === 'model'` 时才用。
+ * 行对象与主菜单同构：`{ id, label, muted?, current? }` —— 余下字段由 `cardLayout` 补几何。
+ *
+ * id 约定：`model:<下标>` 指向 `m.modelRows` 里的条目；下标而不是 `provider/model`
+ * 是因为模型 ID 自己就可能带斜杠（`deepseek-ai/DeepSeek-V3`）。
+ */
+function modelMenuRows(m) {
+  const models = Array.isArray(m.modelRows) ? m.modelRows : []
+  if (m.modelLoading === true) return [{ id: 'model-status', label: '正在读取模型列表…', muted: true }]
+  const error = typeof m.modelError === 'string' ? m.modelError : ''
+  if (error !== '') {
+    return [
+      { id: 'model-status', label: error, muted: true },
+      { id: 'model-refresh', label: '重试' },
+      { id: 'model-input', label: '手动输入…' },
+    ]
+  }
+  if (models.length === 0) {
+    return [
+      { id: 'model-status', label: '没有读到可用模型', muted: true },
+      { id: 'model-refresh', label: '重新读取' },
+      { id: 'model-input', label: '手动输入…' },
+    ]
+  }
+  const visible = Math.min(MODEL_MENU_MAX_ROWS, models.length)
+  const maxOffset = Math.max(0, models.length - visible)
+  const offset = Math.max(0, Math.min(maxOffset, Math.round(Number(m.menuScroll) || 0)))
+  const current = m.model !== null && m.model !== undefined ? m.model : null
+  // 第一行固定是"跟随默认模型"（与原来主菜单里的那一行同一个语义）
+  const rows = [{ id: 'default-model', label: MODEL_LABELS['default-model'], current: current === null }]
+  // 第二行进"推理等级"：等级跟着模型走，所以放在模型菜单里，而不是再占一个头部胶囊
+  // effort 为 null 表示"自动"，必须显式显示成自动，否则这一行会只剩「推理等级：」看起来像坏掉
+  // 末尾的「›」提示这是可以点进去的子菜单，而不是只读状态
+  rows.push({ id: 'effort', label: '推理等级：' + effortLabel(m.effort ?? 'auto') + '  ›' })
+  for (let index = offset; index < offset + visible; index++) {
+    const entry = models[index]
+    rows.push({
+      id: 'model:' + index,
+      label: String(entry.providerName ?? entry.provider ?? '') + ' · ' + String(entry.name ?? entry.model ?? ''),
+      current: current !== null && current.provider === entry.provider && current.model === entry.model,
+    })
+  }
+  rows.push({ id: 'model-input', label: '手动输入…' })
+  return rows
+}
+
+/**
+ * 推理等级菜单的行：`effort:auto` 跟随模型默认，其后是该模型实际支持的档位。
+ * 模型不支持推理（efforts 为空）时只留一行说明，避免给出点不了的档位。
+ */
+function effortMenuRows(m) {
+  if (m.effortLoading === true) {
+    return [
+      { id: 'effort-status', label: '正在读取推理等级…', muted: true },
+      { id: 'effort-back', label: '← 返回模型' },
+    ]
+  }
+  const error = typeof m.effortError === 'string' ? m.effortError : ''
+  if (error !== '') {
+    return [
+      { id: 'effort-status', label: error, muted: true },
+      { id: 'effort-refresh', label: '重试' },
+      { id: 'effort-back', label: '← 返回模型' },
+    ]
+  }
+  const list = Array.isArray(m.effortRows) ? m.effortRows : []
+  const current = typeof m.effort === 'string' && m.effort !== '' ? m.effort : null
+  const rows = [{ id: 'effort:auto', label: '自动（模型默认）', current: current === null }]
+  if (list.length === 0) {
+    rows.push({ id: 'effort-status', label: '该模型不支持推理等级', muted: true })
+  }
+  for (const entry of list) {
+    const id = String(entry?.id ?? '')
+    if (id === '') continue
+    rows.push({ id: 'effort:' + id, label: effortLabel(id, entry.name), current: current === id })
+  }
+  rows.push({ id: 'effort-back', label: '← 返回模型' })
+  return rows
+}
+
+/** 头部模型胶囊的文案：没指定就是「默认模型」，指定了就显示模型 ID（太长截断）。 */
+function modelChipText(model) {
+  if (model === null || model === undefined) return MODEL_CHIP_DEFAULT
+  const id = typeof model.model === 'string' ? model.model : ''
+  if (id === '') return MODEL_CHIP_DEFAULT
+  return id.length > 14 ? id.slice(0, 14) + '…' : id
+}
 
 /**
  * 头部显示的目标语言文案。
@@ -219,22 +348,34 @@ function labelWidth(painter, text, sizePx, s) {
 /**
  * 算整张卡片（DIP）。返回的坐标**已经含阴影外扩**，可直接当窗口内坐标用。
  * @param bodyHeight - 正文区高度（不含上下 padding），由绘制时量出。
- * @param m - `{ langOpen, langW, copyW, retryW }`；缺省走 CARD 里的初值。
+ * @param m - `{ langOpen, langW, modelW, copyW, retryW }`；缺省走 CARD 里的初值。
  */
 export function cardLayout(bodyHeight, m = {}) {
   const langOpen = m.langOpen === true
   const langW = m.langW ?? CARD.langW
+  const modelW = m.modelW ?? CARD.modelW
   const copyW = m.copyW ?? CARD.copyW
   const retryW = m.retryW ?? CARD.retryW
+  const menuMode = m.menuMode === 'model' ? 'model' : m.menuMode === 'effort' ? 'effort' : 'lang'
 
-  // 正文只受"文字多少"影响；下拉是覆盖层。3 行时最小卡片 139 刚好装下菜单（不改变高度）；
-  // 4 行（多了"自定义…"）就装不下了，所以**只有菜单展开且卡片太矮时**才长高，高度由 paintCard 两趟重排。
-  const bodyH = Math.max(CARD.bodyLine, bodyHeight) + CARD.padY * 2
-  const menuBottom = CARD.langTop + CARD.langPad * 2 + CARD.langRowH * LANG_IDS.length
-  const minBodyForMenu = Math.max(0, menuBottom - CARD.headerH - CARD.footerH)
-  const finalBodyH = langOpen ? Math.max(bodyH, minBodyForMenu) : bodyH
   // 卡片宽度：默认 380，用户拖两侧后由 `m.cardW` 传入（夹在 [minWidth, maxWidth]）
   const cardW = Math.max(CARD.minWidth, Math.min(CARD.maxWidth, Math.round(m.cardW ?? CARD.width)))
+
+  // 菜单行：语种菜单是固定的语言/应用；模型与推理等级的行数随可选内容变化。
+  const menuRows = langOpen
+    ? (menuMode === 'model' ? modelMenuRows(m) : menuMode === 'effort' ? effortMenuRows(m) : LANG_MENU_IDS.map((id) => ({ id })))
+    : []
+  // 模型/等级菜单要放"供应商 · 模型名"与说明文字，比语言菜单宽；但不能宽出卡片
+  const menuW = menuMode === 'lang'
+    ? CARD.langWidth
+    : Math.max(CARD.langWidth, Math.min(320, cardW - CARD.edge * 2))
+  const menuH = CARD.langPad * 2 + CARD.langRowH * menuRows.length
+
+  // 下拉含语言与模型设置；仅在菜单展开且卡片太矮时增高，高度由 paintCard 两趟重排。
+  const bodyH = Math.max(CARD.bodyLine, bodyHeight) + CARD.padY * 2
+  const menuBottom = CARD.langTop + menuH
+  const minBodyForMenu = Math.max(0, menuBottom - CARD.headerH - CARD.footerH)
+  const finalBodyH = langOpen ? Math.max(bodyH, minBodyForMenu) : bodyH
   const cardH = CARD.headerH + finalBodyH + CARD.footerH
   const left = CARD.shadow
   const top = CARD.shadow
@@ -250,12 +391,26 @@ export function cardLayout(bodyHeight, m = {}) {
   const footY = top + CARD.headerH + finalBodyH + Math.round((CARD.footerH - icon) / 2)
   const langX = left + CARD.langLeft
   const langY = top + CARD.langTop
-  const rows = LANG_IDS.map((id, index) => ({
-    id,
+  // 头部左侧两个胶囊：语种 / 模型。不能压到右边那排图标；空间不够时先压模型胶囊，
+  // 再压语种胶囊，文字靠 GDI+ 的省略号收尾。
+  const chipTop = top + (CARD.headerH - icon) / 2
+  const chipRightLimit = boltX - CARD.headGap
+  const chipAvail = Math.max(0, chipRightLimit - (left + CARD.edge))
+  let chipLangW = Math.max(70, Math.round(langW))
+  let chipModelW = Math.max(70, Math.round(modelW))
+  if (chipLangW + CARD.chipGap + chipModelW > chipAvail) {
+    const over = chipLangW + CARD.chipGap + chipModelW - chipAvail
+    const modelShrink = Math.min(over, Math.max(0, chipModelW - 70))
+    chipModelW -= modelShrink
+    const rest = over - modelShrink
+    if (rest > 0) chipLangW = Math.max(70, chipLangW - rest)
+  }
+  const chipModelX = left + CARD.edge + chipLangW + CARD.chipGap
+  const rows = menuRows.map((row, index) => ({
+    ...row,
     y: langY + CARD.langPad + index * CARD.langRowH,
     h: CARD.langRowH,
   }))
-  const menuH = CARD.langPad * 2 + CARD.langRowH * LANG_IDS.length
 
   return {
     windowW: cardW + CARD.shadow * 2,
@@ -270,17 +425,19 @@ export function cardLayout(bodyHeight, m = {}) {
       w: cardW - CARD.padX * 2,
       h: finalBodyH - CARD.padY * 2,
     },
-    // 头部命中区。顺序（自右向左）：关闭 │ 分隔线 │ 钉住　即划即译 ｜ 语言
+    // 头部命中区。顺序（自右向左）：关闭 │ 分隔线 │ 钉住　即划即译 ｜ 模型胶囊 ｜ 语种胶囊
     hitClose: { x: closeX, y: top + (CARD.headerH - icon) / 2, w: icon, h: icon },
     hitPin: { x: pinX, y: top + (CARD.headerH - icon) / 2, w: icon, h: icon },
     hitBolt: { x: boltX, y: top + (CARD.headerH - icon) / 2, w: icon, h: icon },
     dividerX,
-    // 语言按钮：宽度**按内容实测**（不能给一大块虚的可点区）
-    hitLang: { x: left + CARD.edge, y: top + (CARD.headerH - icon) / 2, w: langW, h: icon },
+    // 语言胶囊：宽度**按内容实测**（不能给一大块虚的可点区）
+    hitLang: { x: left + CARD.edge, y: chipTop, w: chipLangW, h: icon },
+    // 模型胶囊：语种与模型分开控制（m00830）
+    hitModel: { x: chipModelX, y: chipTop, w: chipModelW, h: icon },
     // 页脚：复制 / 重译，各自贴着自己内容，间距 4（与 .hc-foot 一致）
     hitCopy: { x: left + CARD.edge, y: footY, w: copyW, h: icon },
     hitRetry: { x: left + CARD.edge + copyW + CARD.actionFootGap, y: footY, w: retryW, h: icon },
-    langMenu: langOpen ? { x: langX, y: langY, w: CARD.langWidth, h: menuH, rows } : undefined,
+    langMenu: langOpen ? { x: langX, y: langY, w: menuW, h: menuH, rows, mode: menuMode } : undefined,
   }
 }
 
@@ -319,6 +476,7 @@ export function cardHitTest(x, y, layout) {
   if (inRect(x, y, layout.hitPin)) return 'pin'
   if (inRect(x, y, layout.hitBolt)) return 'bolt'
   if (inRect(x, y, layout.hitLang)) return 'lang'
+  if (inRect(x, y, layout.hitModel)) return 'model'
   if (inRect(x, y, layout.hitCopy)) return 'copy'
   if (inRect(x, y, layout.hitRetry)) return 'retry'
   return null
@@ -331,6 +489,8 @@ export function cardHitTest(x, y, layout) {
  */
 export function headerTooltip(data) {
   if (data.langOpen === true) return null
+  if (data.hover === 'lang') return { id: 'lang', text: '翻译语种' }
+  if (data.hover === 'model') return { id: 'model', text: data.model == null ? '翻译模型：跟随默认' : '翻译模型：' + String(data.model.model ?? '').slice(0, 18) }
   if (data.hover === 'bolt') return { id: 'bolt', text: data.mode === 'icon' ? '即划即译' : '关闭即划即译' }
   if (data.hover === 'pin') return { id: 'pin', text: data.pinned === true ? '取消置顶' : '置顶' }
   return null
@@ -343,7 +503,10 @@ export function headerTooltip(data) {
 export function tooltipRect(layout, id, textW) {
   const t = CARD.tooltip
   const w = Math.round(textW + t.padX * 2)
-  const anchor = id === 'pin' ? layout.hitPin : layout.hitBolt
+  const anchor = id === 'pin' ? layout.hitPin
+    : id === 'model' ? layout.hitModel
+      : id === 'lang' ? layout.hitLang
+        : layout.hitBolt
   const minX = layout.card.x + CARD.edge
   const maxX = layout.card.x + layout.card.w - CARD.edge - w
   const x = Math.max(minX, Math.min(maxX, Math.round(anchor.x + anchor.w / 2 - w / 2)))
@@ -376,6 +539,11 @@ const ICONS = {
     lines: [[[13.5, 3], [13.5, 6], [10.5, 6]]],
   },
   check: { lines: [[[3.5, 8.5], [6.5, 11.5], [12.5, 4.5]]] },
+  // 模型胶囊：两条滑轨 + 两个旋钮，和语种的 globe 区分开
+  tune: {
+    lines: [[[2.2, 5.5], [13.8, 5.5]], [[2.2, 10.5], [13.8, 10.5]]],
+    ellipses: [[4.1, 3.6, 3.8, 3.8], [8.1, 8.6, 3.8, 3.8]],
+  },
   bolt: { polygons: [[[9.5, 1.5], [3.6, 9], [7.7, 9], [6.5, 14.5], [13, 7], [8.9, 7]]] },
   pin: {
     lines: [[[6.5, 1.5], [9.5, 1.5]], [[8, 8.7], [8, 14.3]]],
@@ -442,6 +610,35 @@ function paintShadow(painter, rect, radius, s, options = {}) {
 /* ────────────────────────── 绘制 ────────────────────────── */
 
 /**
+ * 把译文里的 LaTeX 片段换成内联图片占位，返回实际要排版的文本与 images 映射。
+ * 只替换已经渲染好的公式；没就绪的保持原文，下一次重绘再换。
+ */
+function inlineFormulas(text, formulas, painter) {
+  if (!(formulas instanceof Map) || formulas.size === 0) return { text, images: null }
+  const found = findFormulas(text)
+  if (found.length === 0) return { text, images: null }
+  const images = {}
+  let out = ''
+  let last = 0
+  let index = 0
+  for (const item of found) {
+    const entry = formulas.get(item.latex)
+    if (entry === undefined) continue
+    const handle = painter.loadImage(entry.key, entry.png)
+    if (handle === null) continue
+    const key = 'fx' + index
+    index += 1
+    // paragraph 的 drawImage 直接吃 GDI+ 句柄，所以把尺寸摊平进同一个对象。
+    images[key] = { ...handle, width: entry.width, height: entry.height, ascent: entry.ascent, descent: entry.descent }
+    out += text.slice(last, item.start) + '\uE000' + key + '\uE001'
+    last = item.end
+  }
+  if (index === 0) return { text, images: null }
+  out += text.slice(last)
+  return { text: out, images }
+}
+
+/**
  * 画一整张卡片。
  * @param painter - gdi.mjs 的 painterFromHdc 产物。
  * @param width/height - 窗口物理像素（含阴影外扩）。
@@ -449,7 +646,7 @@ function paintShadow(painter, rect, radius, s, options = {}) {
  *   `mode` 为 `'icon'` 时 ⚡ 不高亮（即划即译关掉，改走小图标模式）。
  *   `follow` 为 `false` 时流式期间不跟随底部（用户手动往上滚过）。
  * @param s - 显示器缩放。
- * @returns `{ bodyHeight, contentHeight, scroll, langW, copyW, retryW }` ——
+ * @returns `{ bodyHeight, contentHeight, scroll, langW, modelW, copyW, retryW }` ——
  *   实测尺寸与夹取后的滚动量，调用方据此重排/命中/决定还能不能滚。
  */
 export function paintCard(painter, width, height, data, s) {
@@ -457,6 +654,11 @@ export function paintCard(painter, width, height, data, s) {
   // 归一化放在绘制入口：译文、错误文案、假流式都走这里，一处覆盖全部来源。
   const text = normalizeLineBreaks(data.text)
   const shown = text === '' ? (running ? '翻译中…' : '') : text
+  // 公式：把 LaTeX 片段换成内联图片占位（图片由 main 预先渲染好，paint 只负责贴图）。
+  // 没就绪的公式保持 LaTeX 原文，等渲染完成后再重绘。
+  const inline = inlineFormulas(shown, data.formulaImages, painter)
+  const display = inline.text
+  const images = inline.images
   const bodySize = text === '' ? 14 * s : CARD.bodyFont * s
   const bodyLine = text === '' ? 25 * s : CARD.bodyLine * s
 
@@ -467,7 +669,7 @@ export function paintCard(painter, width, height, data, s) {
   const probeWidth = (cardW - CARD.padX * 2) * s
   const measured = shown === ''
     ? bodyLine
-    : painter.paragraph(shown, 0, 0, probeWidth, { size: bodySize, lineHeight: bodyLine, maxHeight: Infinity, dryRun: true })
+    : painter.paragraph(display, 0, 0, probeWidth, { size: bodySize, lineHeight: bodyLine, maxHeight: Infinity, dryRun: true, images })
   // contentHeight 是"文字全排下来要多高"（可能远高于卡片上限），bodyHeight 是实际卡片高度。
   // 两者之差就是可滚动的量；滚动由调用方经 data.scroll 传进来。
   const contentHeight = measured / s
@@ -482,12 +684,16 @@ export function paintCard(painter, width, height, data, s) {
   const follow = data.status === 'running' && data.follow !== false
   const scroll = follow ? maxScroll : clampScroll(data.scroll, contentHeight, bodyHeight)
 
-  // 头部"语言"按钮宽度：padding + 图标 + 间距 + 标题 + 间距 + 目标语言 + 间距 + 箭头 + padding
+  // 头部两个胶囊的宽度：padding + 图标 + 间距 + 文案 + 间距 + 箭头 + padding
   const titleSize = CARD.titleFont * s
   const label = targetText(data)
-  const titleW = labelWidth(painter, '翻译', titleSize, s)
+  const modelLabel = modelChipText(data.model)
   const labelW = labelWidth(painter, label, titleSize, s)
-  const langW = CARD.headPadX * 2 + CARD.iconSize + CARD.headGap * 3 + titleW + labelW + CARD.caretSize
+  const modelLabelW = labelWidth(painter, modelLabel, titleSize, s)
+  // +4 给 GDI+ 的布局盒留余量：measure 出来的是"紧宽度"，直接拿去排版会把最后一个字省略掉
+  const chipW = (textW) => CARD.headPadX * 2 + CARD.iconSize + CARD.headGap * 2 + textW + CARD.caretSize + 4
+  const langW = chipW(labelW)
+  const modelW = chipW(modelLabelW)
 
   // 页脚按钮宽度：padding + 图标 + 间距 + 文字 + padding（各自贴着自己的内容）
   const copyCaption = data.copied === true ? '已复制' : '复制'
@@ -498,7 +704,24 @@ export function paintCard(painter, width, height, data, s) {
   const copyW = footerW(copyTextW)
   const retryW = footerW(retryTextW)
 
-  const layout = cardLayout(bodyHeight, { cardW, langOpen: data.langOpen, langW, copyW, retryW })
+  const layout = cardLayout(bodyHeight, {
+    cardW,
+    langOpen: data.langOpen,
+    langW,
+    modelW,
+    copyW,
+    retryW,
+    menuMode: data.menuMode,
+    menuScroll: data.menuScroll,
+    modelRows: data.modelRows,
+    modelLoading: data.modelLoading,
+    modelError: data.modelError,
+    model: data.model,
+    effort: data.effort,
+    effortRows: data.effortRows,
+    effortLoading: data.effortLoading,
+    effortError: data.effortError,
+  })
   const hover = data.hover ?? null
   const icon = CARD.iconSize * s
   const card = { x: layout.card.x * s, y: layout.card.y * s, w: layout.card.w * s, h: layout.card.h * s }
@@ -517,19 +740,21 @@ export function paintCard(painter, width, height, data, s) {
   // ── 头部 ──
   const headTop = layout.hitLang.y * s
   const headH = CARD.iconBox * s
-  let cursor = layout.hitLang.x * s + CARD.headPadX * s
   const centerY = (boxH) => headTop + (headH - boxH) / 2
-
-  paintIcon(painter, 'globe', cursor, centerY(icon), icon, COLOR.subtle, s)
-  cursor += icon + CARD.headGap * s
-  // 推进量用"紧宽度"（titleW），绘制矩形给足 MeasureString 的布局盒——否则 GDI+ 会加省略号
-  const titleM = painter.measure('翻译', { size: titleSize })
-  painter.text('翻译', cursor, centerY(titleM.height), titleM.width + 2, titleM.height + 2, { size: titleSize, color: COLOR.subtle })
-  cursor += titleW * s + CARD.headGap * s
-  const labelM = painter.measure(label, { size: titleSize })
-  painter.text(label, cursor, centerY(labelM.height), labelM.width + 2, labelM.height + 2, { size: titleSize, color: COLOR.muted })
-  cursor += labelW * s + CARD.headGap * s
-  paintIcon(painter, 'caret', cursor, centerY(CARD.caretSize * s), CARD.caretSize * s, COLOR.muted, s)
+  /** 一个胶囊：图标 + 文案（自动省略） + 箭头 + 悬浮底色。 */
+  const paintChip = (zone, rect, iconId, caption) => {
+    if (hover === zone) painter.fillRoundRect(rect.x * s, rect.y * s, rect.w * s, rect.h * s, 7 * s, COLOR.hover)
+    const x0 = rect.x * s + CARD.headPadX * s
+    paintIcon(painter, iconId, x0, centerY(icon), icon, COLOR.subtle, s)
+    const textX = x0 + icon + CARD.headGap * s
+    const textW = Math.max(0, (rect.w - CARD.headPadX * 2 - CARD.iconSize - CARD.caretSize - CARD.headGap * 2 + 4) * s)
+    const captionM = painter.measure(caption, { size: titleSize })
+    painter.text(caption, textX, centerY(captionM.height), textW, captionM.height + 2, { size: titleSize, color: COLOR.muted })
+    const caretX = (rect.x + rect.w - CARD.headPadX - CARD.caretSize) * s
+    paintIcon(painter, 'caret', caretX, centerY(CARD.caretSize * s), CARD.caretSize * s, COLOR.muted, s)
+  }
+  paintChip('lang', layout.hitLang, 'globe', label)
+  paintChip('model', layout.hitModel, 'tune', modelLabel)
 
   const paintHeaderIcon = (id, rect, on) => {
     if (hover === id || on) {
@@ -570,11 +795,12 @@ export function paintCard(painter, width, height, data, s) {
     painter.setClip(card.x, layout.bodyTop * s, card.w, layout.bodyH * s)
     // 滚动：把起点上移 scroll，maxHeight 同步加上 scroll —— 于是"什么时候停"的判据
     // （y + maxHeight）在绝对坐标上完全不变，滚出去的部分交给上面的 setClip 裁掉。
-    painter.paragraph(text, area.x * s, area.y * s - scroll * s, area.w * s, {
+    painter.paragraph(display, area.x * s, area.y * s - scroll * s, area.w * s, {
       size: CARD.bodyFont * s,
       lineHeight: CARD.bodyLine * s,
       color: data.status === 'error' ? COLOR.error : COLOR.text,
       maxHeight: area.h * s + scroll * s,
+      images,
     })
     painter.resetClip()
   }
@@ -638,13 +864,19 @@ export function paintCard(painter, width, height, data, s) {
     painter.strokeRoundRect(panel.x, panel.y, panel.w, panel.h, 10 * s, COLOR.border, Math.max(1, Math.round(s)))
     for (const row of menu.rows) {
       const rect = { x: panel.x + CARD.langPad * s, y: row.y * s, w: panel.w - CARD.langPad * 2 * s, h: row.h * s }
-      const on = data.target === row.id
-      if (hover === `lang:${row.id}`) painter.fillRoundRect(rect.x, rect.y, rect.w, rect.h, 7 * s, COLOR.hover)
+      const on = row.current === true
+        || (row.id === 'default-model' ? data.model == null : data.target === row.id)
+      const label = row.label ?? (row.id === 'application'
+        ? (data.application ? (data.applicationDisabled ? '启用此应用' : '禁用此应用') + ' · ' + applicationName(data.application).slice(0, 12) : '未识别来源应用')
+        : MODEL_LABELS[row.id] ?? LANG_LABELS[row.id] ?? row.id)
+      if (row.muted !== true && hover === `lang:${row.id}`) painter.fillRoundRect(rect.x, rect.y, rect.w, rect.h, 7 * s, COLOR.hover)
       const size = 13 * s
-      const box = painter.measure(LANG_LABELS[row.id], { size })
-      painter.text(LANG_LABELS[row.id], rect.x + 8 * s, rect.y + (rect.h - box.height) / 2, rect.w - 16 * s, box.height + 2, {
+      const box = painter.measure(label, { size })
+      painter.text(label, rect.x + 8 * s, rect.y + (rect.h - box.height) / 2, rect.w - 16 * s, box.height + 2, {
         size,
-        color: on ? COLOR.accent : COLOR.text,
+        color: row.muted === true
+          ? COLOR.muted
+          : row.id === 'application' && !data.application ? COLOR.muted : on ? COLOR.accent : COLOR.text,
       })
       if (on) paintIcon(painter, 'check', rect.x + rect.w - 8 * s - 14 * s, rect.y + (rect.h - 14 * s) / 2, 14 * s, COLOR.accent, s)
     }
@@ -667,5 +899,5 @@ export function paintCard(painter, width, height, data, s) {
     })
   }
 
-  return { bodyHeight, contentHeight, scroll, langW, copyW, retryW, cardW }
+  return { bodyHeight, contentHeight, scroll, langW, modelW, copyW, retryW, cardW }
 }

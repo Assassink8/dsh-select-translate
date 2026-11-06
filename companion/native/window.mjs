@@ -29,6 +29,7 @@ const WM = {
   MOUSELEAVE: 0x02a3,
   RBUTTONDOWN: 0x0204,
   MOVE: 0x0003,
+  HOTKEY: 0x0312,
   ENTERSIZEMOVE: 0x0231,
   EXITSIZEMOVE: 0x0232,
   GETMINMAXINFO: 0x0024,
@@ -182,6 +183,8 @@ export function createNativeWindow(options) {
     TrackMouseEvent: user32.func('bool TrackMouseEvent(_Inout_ DST_NW_TRACKMOUSEEVENT *event)'),
     GetDpiForWindow: user32.func('uint32 GetDpiForWindow(void *hwnd)'),
     GetWindowRect: user32.func('bool GetWindowRect(void *hwnd, _Out_ DST_NW_RECT *rect)'),
+    RegisterHotKey: user32.func('bool RegisterHotKey(void *hwnd, int id, uint32_t mods, uint32_t vk)'),
+    UnregisterHotKey: user32.func('bool UnregisterHotKey(void *hwnd, int id)'),
   }
   const g = {
     CreateCompatibleDC: gdi32.func('void *CreateCompatibleDC(void *hdc)'),
@@ -191,11 +194,14 @@ export function createNativeWindow(options) {
     DeleteDC: gdi32.func('int DeleteDC(void *hdc)'),
     CreateRoundRectRgn: gdi32.func('void *CreateRoundRectRgn(int x1, int y1, int x2, int y2, int w, int h)'),
     CreateEllipticRgn: gdi32.func('void *CreateEllipticRgn(int x1, int y1, int x2, int y2)'),
+    CreateRectRgn: gdi32.func('void *CreateRectRgn(int x1, int y1, int x2, int y2)'),
+    CombineRgn: gdi32.func('int CombineRgn(void *dst, void *src1, void *src2, int mode)'),
   }
   const SetWindowRgn = user32.func('int SetWindowRgn(void *hwnd, void *hrgn, bool redraw)')
 
   const WS_POPUP = 0x80000000
   const WS_EX_LAYERED = 0x00080000
+  const WS_EX_TRANSPARENT = 0x00000020
   const WS_EX_TOOLWINDOW = 0x00000080
   const WS_EX_TOPMOST = 0x00000008
   const WS_EX_NOACTIVATE = 0x08000000
@@ -540,6 +546,10 @@ export function createNativeWindow(options) {
         }
         return 0
       }
+      case WM.HOTKEY: {
+        options.onHotkey?.(Number(wParam), Number(lParam))
+        return 0
+      }
       case WM.DPICHANGED: {
         const suggested = lParam
         options.onDpiChanged?.(scale(), suggested)
@@ -585,7 +595,7 @@ export function createNativeWindow(options) {
         hIconSm: null,
       }
       u.RegisterClassExW(wc)
-      const exStyle = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE
+      const exStyle = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | (options.clickThrough === true ? WS_EX_TRANSPARENT : 0)
       const hwnd = u.CreateWindowExW(exStyle, className, options.title ?? 'DSH', WS_POPUP, -32000, -32000, 10, 10, null, null, u.GetModuleHandleW(null), null)
       if (hwnd === null) throw new Error('CreateWindowExW failed')
       state.hwnd = hwnd
@@ -623,8 +633,40 @@ export function createNativeWindow(options) {
     invalidate,
     scale,
     state,
+    /** 注册全局热键（会从其它程序那里收走这个组合键）。 */
+    registerHotkey(id, mods, vk) {
+      if (state.hwnd === null) return false
+      return u.RegisterHotKey(state.hwnd, id, mods, vk) === true
+    },
+    unregisterHotkey(id) {
+      if (state.hwnd === null) return false
+      return u.UnregisterHotKey(state.hwnd, id) === true
+    },
     /** 当前窗口尺寸（物理像素）。 */
     size: () => ({ width: state.width, height: state.height }),
+    /**
+     * 用窗口区域挖洞（客户端坐标）：传 null 恢复整窗。
+     *
+     * 为什么要有它：全屏压暗层如果每次拖动都重画 DIB + UpdateLayeredWindow，
+     * 一帧要 60–90ms（6400×2160 的逐像素 blit），鼠标一动就排队。改用窗口区域后，
+     * 压暗层只画一次，拖动时只改区域（几十微秒），选区自然透出下面的屏幕。
+     */
+    setRegion(rects) {
+      if (state.hwnd === null || state.destroyed) return false
+      if (rects === null || rects === undefined || rects.length === 0) {
+        return SetWindowRgn(state.hwnd, null, true) !== 0
+      }
+      const full = g.CreateRectRgn(0, 0, state.width, state.height)
+      if (full === null) return false
+      for (const r of rects) {
+        const hole = g.CreateRectRgn(Math.round(r.x), Math.round(r.y), Math.round(r.x + r.w), Math.round(r.y + r.h))
+        if (hole === null) continue
+        g.CombineRgn(full, full, hole, 4 /* RGN_DIFF */)
+        g.DeleteObject(hole)
+      }
+      // 成功后区域归窗口所有，不能再 DeleteObject
+      return SetWindowRgn(state.hwnd, full, true) !== 0
+    },
     /**
      * 更新业务状态并重绘。
      * 就地合并（不换对象）：绘制期间回写的 contentHeight / stopBox 等要向调用方可见。

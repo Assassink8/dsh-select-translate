@@ -11,3 +11,7 @@ yarn.lock
 .DS_Store
 Thumbs.db
 *.log
+
+# 本地临时脚本与产物
+.tmp-*
+dsh-select-translate-runtime.json

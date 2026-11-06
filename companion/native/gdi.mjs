@@ -28,6 +28,7 @@ export function createGdi(koffi) {
   const gdiplus = koffi.load('gdiplus.dll')
   const user32 = koffi.load('user32.dll')
   const gdi32 = koffi.load('gdi32.dll')
+  const shlwapi = koffi.load('shlwapi.dll')
 
   const RECT = koffi.struct('DST_GDI_RECT', { left: 'long', top: 'long', right: 'long', bottom: 'long' })
   const RectF = koffi.struct('DST_RectF', { X: 'float', Y: 'float', Width: 'float', Height: 'float' })
@@ -74,6 +75,9 @@ export function createGdi(koffi) {
     DrawEllipse: gdiplus.func('int GdipDrawEllipse(void *graphics, void *pen, float x, float y, float w, float h)'),
     SetClipRect: gdiplus.func('int GdipSetClipRect(void *graphics, float x, float y, float w, float h, int combineMode)'),
     ResetClip: gdiplus.func('int GdipResetClip(void *graphics)'),
+    GdipCreateBitmapFromStream: gdiplus.func('int GdipCreateBitmapFromStream(void *stream, _Out_ void **bitmap)'),
+    GdipDrawImageRectI: gdiplus.func('int GdipDrawImageRectI(void *graphics, void *image, int x, int y, int w, int h)'),
+    GdipDisposeImage: gdiplus.func('int GdipDisposeImage(void *image)'),
   }
 
   // 注意：CreateCompatibleDC / BitBlt / SelectObject 都在 gdi32，不在 user32（踩过）。
@@ -88,11 +92,13 @@ export function createGdi(koffi) {
     DeleteObject: gdi32.func('int DeleteObject(void *obj)'),
     BitBlt: gdi32.func('int BitBlt(void *dst, int x, int y, int w, int h, void *src, int sx, int sy, uint32_t rop)'),
     CreateSolidBrush: gdi32.func('void *CreateSolidBrush(uint32_t color)'),
+    SHCreateMemStream: shlwapi.func('void *SHCreateMemStream(const uint8_t *pInit, unsigned int cbInit)'),
   }
 
   const SRCCOPY = 0x00cc0020
   const fonts = new Map()
   const brushes = new Map()
+  const imageCache = new Map()
   let families = null
   let token = 0
   let started = false
@@ -136,6 +142,28 @@ export function createGdi(koffi) {
     if (gdip.CreateSolidFill(color, out) !== 0) return null
     brushes.set(color, out[0])
     return out[0]
+  }
+
+  /**
+   * 把 PNG 字节变成 GDI+ 位图（整个进程内按 key 缓存）。
+   * 用 SHCreateMemStream 而不是写临时文件：插件承诺不落盘，图片也一样。
+   * 注意：GDI+ 会持有 IStream，所以 stream 必须和 bitmap 一起缓存，不能提前释放。
+   */
+  function loadImage(key, bytes) {
+    const cached = imageCache.get(key)
+    if (cached !== undefined) return cached
+    if (bytes === null || bytes === undefined) return null
+    const data = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)
+    if (data.length === 0) return null
+    const stream = native.SHCreateMemStream(data, data.length)
+    if (stream === null) return null
+    const out = [null]
+    if (gdip.GdipCreateBitmapFromStream(stream, out) !== 0 || out[0] === null) return null
+    const entry = { stream, bitmap: out[0], data }
+    // 公式图按「字号:公式」缓存：长会话里可能见到很多不同公式。给个上限，避免只增不减。
+    if (imageCache.size >= 200) imageCache.clear()
+    imageCache.set(key, entry)
+    return entry
   }
 
   /** 圆角矩形路径。 */
@@ -204,6 +232,15 @@ export function createGdi(koffi) {
         gdip.DrawLine(graphics, pen[0], x1, y1, x2, y2)
         gdip.DeletePen(pen[0])
       },
+      /** 载入一张 PNG 位图（按 key 缓存；公式用）。 */
+      loadImage(key, bytes) {
+        return loadImage(key, bytes)
+      },
+      /** 把位图画到 (x, y)，宽高为物理像素。 */
+      drawImage(entry, x, y, w, h) {
+        if (entry === null || entry === undefined) return
+        gdip.GdipDrawImageRectI(graphics, entry.bitmap, Math.round(x), Math.round(y), Math.max(1, Math.round(w)), Math.max(1, Math.round(h)))
+      },
       /** 单行文本（超出省略）。 */
       text(text, x, y, w, h, { size = 14, bold = false, mono = false, color = 0xff000000 } = {}) {
         const f = font(size, { bold, mono })
@@ -223,16 +260,47 @@ export function createGdi(koffi) {
         return { width: box.Width ?? 0, height: box.Height ?? size * 1.4 }
       },
       /**
-       * 换行绘制一段文本（自己排版：按空格/CJK 边界断行，支持粗体与等宽混排）。
+       * 换行绘制一段文本（自己排版：按空格/CJK 边界断行，支持粗体与等宽混排；可内联图片）。
+       * 文本里用 U+E000<key>U+E001 的形式引用 images[key]。
        * @returns 实际绘制高度。
        */
-      paragraph(text, x, y, w, { size = 14, lineHeight = null, color = 0xff000000, bold = false, mono = false, maxHeight = Infinity, dryRun = false, indent = 0 } = {}) {
+      paragraph(text, x, y, w, { size = 14, lineHeight = null, color = 0xff000000, bold = false, mono = false, maxHeight = Infinity, dryRun = false, indent = 0, images = null } = {}) {
         const lh = lineHeight ?? Math.round(size * 1.55)
-        const tokens = tokenize(text, { bold, mono, size, measure: (t, opts) => this.measure(t, opts) })
+        // 先按内联图片标记把文本切段：图片段不参与 tokenize，文本段照旧逐字断行。
+        const segmented = []
+        for (const part of String(text).split(/(\uE000[^\uE001]{1,64}\uE001)/)) {
+          if (part === '') continue
+          const imageMark = /^\uE000([^\uE001]{1,64})\uE001$/.exec(part)
+          if (imageMark !== null) {
+            segmented.push({ image: imageMark[1] })
+            continue
+          }
+          segmented.push(...tokenize(part, { bold, mono, size, measure: (t, opts) => this.measure(t, opts) }))
+        }
+        // 单个 token 比整行还宽时（URL、长英文单词、无空格代码），逐 token 断行会让它
+        // 整段冲向右边、吃掉右侧内边距。这里先把它拆成单字符 token，让换行能落在任意位置。
+        const tokens = []
+        for (const tk of segmented) {
+          if (tk.break === true || tk.image !== undefined || !(tk.width > w)) {
+            tokens.push(tk)
+            continue
+          }
+          for (const char of tk.text) {
+            tokens.push({
+              text: char,
+              width: this.measure(char, { size: tk.size, bold: tk.bold, mono: tk.mono }).width,
+              size: tk.size,
+              bold: tk.bold,
+              mono: tk.mono,
+            })
+          }
+        }
         let cursorX = x
         let cursorY = y
         let firstLine = true
         let lineText = ''
+        /** 当前行高：文字行用 lh，内联公式比文字高时按公式撑开。 */
+        let lineH = lh
         // 连续同格式的 token 合成一次 DrawString。
         // 为什么必须合：CJK 在 tokenize 里是**逐字**成 token 的（为了能逐字断行），
         // 如果逐字 DrawString，每画一个字都会各自推进一次字形宽度，中文看起来就像
@@ -252,10 +320,40 @@ export function createGdi(koffi) {
           if (tk.break === true) {
             flushRun()
             cursorX = x
-            cursorY += lh
+            cursorY += lineH
+            lineH = lh
             firstLine = false
             lineText = ''
-            if (cursorY + lh > y + maxHeight) return cursorY - y
+            if (cursorY + lineH > y + maxHeight) return cursorY - y + lineH
+            continue
+          }
+          if (tk.image !== undefined) {
+            const img = images !== null && images !== undefined ? images[tk.image] : null
+            if (img === null || img === undefined) continue
+            const lineStart = firstLine ? x + indent : x
+            const avail = Math.max(1, x + w - lineStart)
+            const fit = img.width > avail && img.width > 0 ? avail / img.width : 1
+            const dw = Math.max(1, img.width * fit)
+            const dh = Math.max(1, img.height * fit)
+            if (cursorX + dw > x + w && cursorX > lineStart) {
+              flushRun()
+              cursorX = x
+              cursorY += lineH
+              lineH = lh
+              firstLine = false
+              lineText = ''
+            }
+            const ascent = (img.ascent ?? dh) * fit
+            const baseline = cursorY + lh * 0.82
+            // 行内公式一般按基线对齐；比文字高得多的（积分、矩阵）贴到行顶，免得压到上一行。
+            const drawY = Math.max(cursorY, baseline - ascent)
+            lineH = Math.max(lineH, drawY - cursorY + dh)
+            if (cursorY + lineH > y + maxHeight) return cursorY - y + lineH
+            if (!dryRun) {
+              flushRun()
+              this.drawImage(img, cursorX, drawY, dw, dh)
+            }
+            cursorX += dw
             continue
           }
           const lineStart = firstLine ? x + indent : x
@@ -269,10 +367,11 @@ export function createGdi(koffi) {
             if (!fits && !NO_LINE_START.test(tk.text)) {
               flushRun()
               cursorX = x
-              cursorY += lh
+              cursorY += lineH
+              lineH = lh
               firstLine = false
               lineText = ''
-              if (cursorY + lh > y + maxHeight) return cursorY - y
+              if (cursorY + lineH > y + maxHeight) return cursorY - y + lineH
             }
           }
           if (!dryRun) {
@@ -295,7 +394,7 @@ export function createGdi(koffi) {
           cursorX += tk.width
         }
         flushRun()
-        return cursorY - y + lh
+        return cursorY - y + lineH
       },
       /** 设置/恢复裁剪矩形（画超出区域的滚动内容时必须用，否则会盖到页脚上）。 */
       setClip(x, y, w, h) {

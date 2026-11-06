@@ -67,12 +67,34 @@ SOFTWARE.
 
 ---
 
-## 2. 本项目自身的许可
+## 2. 公式渲染（可选依赖，不随包内联）
+
+公式渲染（见 `companion/formula.mjs`）在运行时调用下面两个 npm 包。它们**不打包进本仓库**，而是由 npm 作为可选依赖安装；缺失时插件仍可运行，只是公式保留 LaTeX 原文。
+
+| 包 | 用途 | 许可 | 版权 |
+|---|---|---|---|
+| `mathjax-full` | TeX → SVG（纯 JS，字形以路径输出） | Apache-2.0 | Copyright (c) The MathJax Consortium |
+| `@resvg/resvg-wasm` | SVG → PNG（WebAssembly） | MPL-2.0 | Copyright (c) 2018-2023 resvg developers |
+
+两者的完整许可文本随各自的 npm 包分发（`node_modules/<包>/LICENSE`），此处仅作声明。
+
+### 2.1 设置页 schema（运行时依赖）
+
+插件设置页的字段（截图翻译热键）用 DSH 自带的 schema 库声明（见 `index.js` 的 `export const Config`）。这是**运行时依赖**（不是可选），随 npm 安装：
+
+| 包 | 用途 | 许可 | 版权 |
+|---|---|---|---|
+| `@deepseek-ai/schemastery` | 声明设置页字段（`Config`） | MIT | Copyright (c) DeepSeek |
+| `@deepseek-ai/cosmokit` | 上者的传递依赖 | MIT | Copyright (c) DeepSeek |
+
+---
+
+## 3. 本项目自身的许可
 
 除 1.1 列出的衍生文件外，本插件其余代码同样以 **MIT** 发布，见 `LICENSE`。
 两者兼容：MIT 允许再许可与再分发，唯一条件是保留上面的版权与许可声明——本文件即为此而存在。
 
-## 3. 维护须知
+## 4. 维护须知
 
 - **不要删除本文件**，也不要在 `package.json` 的 `files` 里把它排除掉。
 - 以后再从上游同步代码时，请在 1.1 表格里更新「与上游的关系 / 我们做的改动」两列。

@@ -61,7 +61,7 @@ export function createTranslator(options = {}) {
    * 一律 resolve、不抛错：`{ answer, firstTokenMs, totalMs, aborted, error }`。
    * 主动取消时 `aborted: true` 且 `error: null`（调用方不该把它当失败弹红字）。
    *
-   * @param request - `{ text, target, requestId }`。
+   * @param request - `{ text, target, requestId, ocr?, formula? }`（`ocr` = 来自截图识别；`formula` = 整段是公式）。
    * @param onEvent - `{type:'delta', chunk, answer}` / `{type:'done', answer, usage, finish}` / `{type:'error', message}`。
    */
   async function run(request, onEvent = () => {}) {
@@ -79,7 +79,13 @@ export function createTranslator(options = {}) {
       const response = await fetchImpl(origin + '/dsh-select-translate/api/translate', {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(typeof token === 'string' && token !== '' ? { 'x-dsh-select-translate-token': token } : {}) },
-        body: JSON.stringify({ text: request.text, target: request.target, requestId: String(request.requestId) }),
+        body: JSON.stringify({
+          text: request.text,
+          target: request.target,
+          requestId: String(request.requestId),
+          ...(request.ocr === true ? { ocr: true } : {}),
+          ...(request.formula === true ? { formula: true } : {}),
+        }),
         signal: controller.signal,
       })
 
